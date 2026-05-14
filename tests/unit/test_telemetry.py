@@ -19,14 +19,7 @@ import pytest
 
 from godot_ai import telemetry as tel
 
-
-@pytest.fixture
-def isolated_data_dir(monkeypatch, tmp_path: Path) -> Path:
-    """Force the collector's data dir into a tmp_path; isolate every test."""
-    monkeypatch.setattr(tel.TelemetryConfig, "_get_data_directory", lambda self: tmp_path)
-    tel.reset_telemetry()
-    yield tmp_path
-    tel.reset_telemetry()
+## ``isolated_data_dir`` comes from ``tests/unit/conftest.py``.
 
 
 @pytest.fixture

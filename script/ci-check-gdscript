@@ -10,6 +10,7 @@
 # If import_log is provided, scans it for SCRIPT ERROR / Parse Error lines.
 # If omitted, runs a single import pass and checks its output.
 set -euo pipefail
+source "$(dirname "$0")/_ci_env.sh"
 
 PROJECT_DIR="${PROJECT_DIR:-test_project}"
 

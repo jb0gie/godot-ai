@@ -209,6 +209,27 @@ func test_bind_event_mouse_button_zero_button() -> void:
 	_handler.remove_action({"action": TEST_ACTION})
 
 
+func test_bind_event_joy_axis_missing_axis() -> void:
+	_handler.add_action({"action": TEST_ACTION})
+	var result := _handler.bind_event({
+		"action": TEST_ACTION,
+		"event_type": "joy_axis",
+	})
+	assert_is_error(result, ErrorCodes.MISSING_REQUIRED_PARAM)
+	_handler.remove_action({"action": TEST_ACTION})
+
+
+func test_bind_event_joy_axis_null_axis() -> void:
+	_handler.add_action({"action": TEST_ACTION})
+	var result := _handler.bind_event({
+		"action": TEST_ACTION,
+		"event_type": "joy_axis",
+		"axis": null,
+	})
+	assert_is_error(result, ErrorCodes.MISSING_REQUIRED_PARAM)
+	_handler.remove_action({"action": TEST_ACTION})
+
+
 func test_bind_event_unknown_action_message_suggests_add_action() -> void:
 	## The error string should point the caller at the fix so they don't loop.
 	var result := _handler.bind_event({
@@ -231,4 +252,21 @@ func test_bind_key_event() -> void:
 	assert_eq(result.data.action, TEST_ACTION)
 	assert_has_key(result.data, "event")
 	assert_eq(result.data.event.type, "key")
+	_handler.remove_action({"action": TEST_ACTION})
+
+
+func test_bind_joy_axis_event() -> void:
+	_handler.add_action({"action": TEST_ACTION})
+	var result := _handler.bind_event({
+		"action": TEST_ACTION,
+		"event_type": "joy_axis",
+		"axis": JOY_AXIS_LEFT_X,
+		"axis_value": -1.0,
+	})
+	assert_has_key(result, "data")
+	assert_eq(result.data.action, TEST_ACTION)
+	assert_has_key(result.data, "event")
+	assert_eq(result.data.event.type, "joy_axis")
+	assert_eq(result.data.event.axis, JOY_AXIS_LEFT_X)
+	assert_eq(result.data.event.axis_value, -1.0)
 	_handler.remove_action({"action": TEST_ACTION})

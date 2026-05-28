@@ -194,8 +194,35 @@ func _create_event(event_type: String, params: Dictionary):
 			var ev := InputEventJoypadButton.new()
 			ev.button_index = int(params.get("button", 0))
 			return ev
+		"joy_axis":
+			var axis_param = params.get("axis", null)
+			if axis_param == null:
+				return ErrorCodes.make(ErrorCodes.MISSING_REQUIRED_PARAM,
+					"event_type='joy_axis' requires axis (JoyAxis index, e.g. 0=left stick X, 1=left stick Y).")
+			var axis: int
+			match typeof(axis_param):
+				TYPE_INT:
+					axis = axis_param
+				TYPE_FLOAT:
+					if axis_param != floor(axis_param):
+						return ErrorCodes.make(ErrorCodes.VALUE_OUT_OF_RANGE,
+							"joy_axis axis must be an integer JoyAxis index (got %s)." % str(axis_param))
+					axis = int(axis_param)
+				TYPE_STRING:
+					var axis_text := str(axis_param)
+					if not axis_text.is_valid_int():
+						return ErrorCodes.make(ErrorCodes.WRONG_TYPE,
+							"joy_axis axis must be an integer JoyAxis index (got '%s')." % axis_text)
+					axis = int(axis_text)
+				_:
+					return ErrorCodes.make(ErrorCodes.WRONG_TYPE,
+						"joy_axis axis must be an integer JoyAxis index (got %s)." % type_string(typeof(axis_param)))
+			var ev := InputEventJoypadMotion.new()
+			ev.axis = axis
+			ev.axis_value = float(params.get("axis_value", 1.0))
+			return ev
 	return ErrorCodes.make(ErrorCodes.VALUE_OUT_OF_RANGE,
-		"Unsupported event_type: '%s'. Use 'key', 'mouse_button', or 'joy_button'." % event_type)
+		"Unsupported event_type: '%s'. Use 'key', 'mouse_button', 'joy_button', or 'joy_axis'." % event_type)
 
 
 func _serialize_event(event: InputEvent) -> Dictionary:

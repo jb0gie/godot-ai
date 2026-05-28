@@ -30,10 +30,12 @@ Ops:
   • remove_action(action)
         Remove an action and all its event bindings.
   • bind_event(action, event_type, keycode="", ctrl=False, alt=False,
-                shift=False, meta=False, button=None)
+                shift=False, meta=False, button=None, axis=None,
+                axis_value=1.0)
         Bind a key/mouse/gamepad event to an action. The action must
         already exist (call ``add_action`` first). ``event_type`` is
-        ``"key"`` | ``"mouse_button"`` | ``"joy_button"``.
+        ``"key"`` | ``"mouse_button"`` | ``"joy_button"`` |
+        ``"joy_axis"``.
           - ``key``: ``keycode`` is a Godot keycode *name string* like
             ``"A"``, ``"Space"``, ``"Enter"``, ``"Escape"``, ``"F1"``,
             ``"Left"`` — not an integer and not ``KEY_*``. Modifier
@@ -42,6 +44,8 @@ Ops:
             3=middle, 4=wheel up, 5=wheel down.
           - ``joy_button``: ``button`` is the ``JoyButton`` index
             (e.g. 0=A/Cross, 1=B/Circle).
+          - ``joy_axis``: ``axis`` is the ``JoyAxis`` index and
+            ``axis_value`` is the direction/value, usually -1.0 or 1.0.
 """
 
 

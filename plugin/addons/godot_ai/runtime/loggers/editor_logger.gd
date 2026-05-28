@@ -4,15 +4,14 @@ extends Logger
 ## Editor-process Logger subclass.
 ##
 ## NOTE: deliberately no `class_name` — `extends Logger` requires the Logger
-## class which Godot only exposes from 4.5+. plugin.gd loads this script
-## dynamically via load() and only calls OS.add_logger() after gating on
-## ClassDB.class_exists("Logger"). On Godot < 4.5 the editor filesystem scan
-## still parses this file and emits a benign `Parse Error: Could not find
-## base class "Logger"` to the Output panel; the script is never instanced
-## or used. (Side effect: `script/ci-check-gdscript` greps for "Parse Error"
-## as a hard failure, so it reports false positives when run locally against
-## a Godot < 4.5 install. CI itself runs on the pinned 4.6.2 and is
-## unaffected.) Registered via OS.add_logger() from plugin.gd::_enter_tree
+## class which Godot only exposes from 4.5+. This file lives in the
+## `.gdignore`'d `runtime/loggers/` folder so Godot's editor filesystem scan
+## skips it entirely — on Godot < 4.5 it is never parsed, so it emits no
+## "Could not find base class Logger" error (it used to, before #475's
+## follow-up). plugin.gd builds it from source at runtime via
+## `logger_loader.gd` and only calls OS.add_logger() after gating on
+## ClassDB.class_exists("Logger"), so the `extends Logger` parse only ever
+## happens on 4.5+ where it resolves. Registered from plugin.gd::_enter_tree
 ## so we can intercept editor-process script errors — parse errors, @tool
 ## runtime errors, EditorPlugin errors, push_error/push_warning — and
 ## surface them via `logs_read(source="editor")`. Without this, the LLM
@@ -33,6 +32,14 @@ extends Logger
 ## mutex-protected so we can append directly without an intermediate queue.
 
 const ADDON_PATH_MARKER := "/addons/godot_ai/"
+
+## Resolve McpLogBacktrace by path, not by the `McpLogBacktrace` class_name.
+## This script is compiled from source at runtime by logger_loader.gd; a bare
+## class_name reference depends on the global class-name table being populated
+## at compile time, which isn't guaranteed on a cold editor enable mid-scan.
+## `const preload` resolves at compile time independent of the registry —
+## matches game_logger.gd's deliberate choice for the same reason.
+const _LogBacktrace := preload("res://addons/godot_ai/utils/log_backtrace.gd")
 
 ## McpEditorLogBuffer — untyped because this script is loaded dynamically and
 ## McpEditorLogBuffer's class_name isn't yet registered on the parser at the
@@ -66,7 +73,7 @@ func _log_error(
 	var message_res_path := _extract_user_res_path(message)
 	if not _is_user_script(file) and script_backtraces.is_empty() and message_res_path.is_empty():
 		return
-	var resolved := McpLogBacktrace.resolve_error(
+	var resolved := _LogBacktrace.resolve_error(
 		function, file, line, code, rationale, error_type, script_backtraces,
 	)
 	if not _is_user_script(resolved.path):

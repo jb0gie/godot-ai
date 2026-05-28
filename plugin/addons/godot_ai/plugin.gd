@@ -7,9 +7,12 @@ const GAME_HELPER_AUTOLOAD_PATH := "res://addons/godot_ai/runtime/game_helper.gd
 ## Editor-process Logger subclass — captures parse errors, @tool runtime
 ## errors, and push_error/push_warning so the LLM can read them via
 ## `logs_read(source="editor")`. Loaded dynamically because
-## `extends Logger` requires Godot 4.5+; gating on ClassDB at registration
-## time keeps the plugin loadable on 4.4. See issue #231.
-const EDITOR_LOGGER_PATH := "res://addons/godot_ai/runtime/editor_logger.gd"
+## `extends Logger` requires Godot 4.5+. The logger script lives in the
+## `.gdignore`'d `runtime/loggers/` folder so Godot's editor scan never
+## parses it (no "Could not find base class Logger" error on < 4.5), and
+## LoggerLoader compiles it from source at runtime only after the
+## ClassDB.class_exists("Logger") gate below. See issue #231 / #475.
+const LoggerLoader := preload("res://addons/godot_ai/runtime/logger_loader.gd")
 
 ## EditorSettings keys used to remember which server process the plugin
 ## spawned — survives editor restarts, lets a later editor session adopt
@@ -190,6 +193,13 @@ func _enter_tree() -> void:
 		_headless_disabled = true
 		print("MCP | plugin disabled in headless mode")
 		return
+
+	## Self-update from a pre-loggers/ version leaves the old logger scripts
+	## orphaned at runtime/*.gd (the runner only writes files in the new ZIP,
+	## it doesn't prune). Those still `extends Logger` and re-emit the parse
+	## errors on Godot < 4.5. Delete them once so upgraders match a fresh
+	## install. No-op on fresh installs and dev checkouts (files absent).
+	_cleanup_legacy_logger_scripts()
 
 	## Register port overrides before spawn so `http_port()` / `ws_port()`
 	## return the user's configured values (if any) when `_start_server`
@@ -503,11 +513,29 @@ func _exit_tree() -> void:
 func _attach_editor_logger() -> void:
 	if not (ClassDB.class_exists("Logger") and OS.has_method("add_logger")):
 		return
-	var logger_script := load(EDITOR_LOGGER_PATH)
+	var logger_script := LoggerLoader.build(LoggerLoader.EDITOR_LOGGER_PATH)
 	if logger_script == null:
 		return
 	_editor_logger = logger_script.new(_editor_log_buffer)
 	OS.call("add_logger", _editor_logger)
+
+
+## Remove the pre-2.5.8 logger scripts left at runtime/*.gd by a self-update
+## (the runner doesn't prune files dropped between versions). They `extends
+## Logger` and would re-emit "Could not find base class Logger" parse errors
+## on Godot < 4.5 even though the live copies now live in the .gdignore'd
+## runtime/loggers/ folder. Idempotent: existence-guarded, so it's a no-op on
+## fresh installs and symlinked dev checkouts.
+func _cleanup_legacy_logger_scripts() -> void:
+	var legacy := [
+		"res://addons/godot_ai/runtime/editor_logger.gd",
+		"res://addons/godot_ai/runtime/editor_logger.gd.uid",
+		"res://addons/godot_ai/runtime/game_logger.gd",
+		"res://addons/godot_ai/runtime/game_logger.gd.uid",
+	]
+	for res_path in legacy:
+		if FileAccess.file_exists(res_path):
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(res_path))
 
 
 func _detach_editor_logger() -> void:

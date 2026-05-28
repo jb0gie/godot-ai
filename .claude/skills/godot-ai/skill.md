@@ -78,7 +78,7 @@ Run Godot tests: use `run_tests` MCP tool (no reload needed for test file edits)
 
 Test guardrails: the runner flags tests with 0 assertions as failures (catches silent `return` before asserting). Always use `assert_true(false, "reason")` before early `return` in test methods. Test discovery is resilient — a broken `.gd` file doesn't kill discovery of the rest.
 
-Version-gated skips: for a test that depends on 4.4+-only behavior, call `if skip_on_godot_lt("4.4", "reason"): return` at the top (`McpTestSuite.skip_on_godot_lt` returns `bool`). CI runs a Godot 4.3 Linux canary (`Godot tests / Linux (Godot 4.3)`, pinned to `4.3.0`) in addition to the three 4.6.2 OS rows; the canary sets `ALLOW_LOGGER_PARSE_ERRORS=1` (suppresses the benign `extends Logger` parse errors in `ci-check-gdscript`) and `SKIP_POSTCHURN_TEST_RUN=1` (the reload smoke's post-churn `test_run` outruns the 30s curl timeout on slow 4.3 GDScript exec).
+Version-gated skips: for a test that depends on 4.4+-only behavior, call `if skip_on_godot_lt("4.4", "reason"): return` at the top (`McpTestSuite.skip_on_godot_lt` returns `bool`). CI runs a Godot 4.3 Linux canary (`Godot tests / Linux (Godot 4.3)`, pinned to `4.3.0`) in addition to the three 4.6.2 OS rows; the canary sets `SKIP_POSTCHURN_TEST_RUN=1` (the reload smoke's post-churn `test_run` outruns the 30s curl timeout on slow 4.3 GDScript exec). `ci-check-gdscript` is strict on all versions — the `extends Logger` scripts live in the `.gdignore`'d `runtime/loggers/` folder (built at runtime by `logger_loader.gd`), so 4.3 has zero parse errors with no allowlist.
 
 ## GDScript conventions
 
@@ -92,7 +92,7 @@ Version-gated skips: for a test that depends on 4.4+-only behavior, call `if ski
 - Use `##` for doc comments, typed arrays (`Array[String]`), never Python-style `"""`
 - Main thread only — 4ms frame budget in `_process()`, use `call_deferred` for mutations
 - **Forward-compat engine APIs**: call newer-than-4.3 engine methods via `Engine.call("method", ...)` / `OS.call("method", ...)`, never a direct reference. A direct `Engine.capture_script_backtraces(...)` is rejected by the 4.3 *parser* (type-checked against the native class) even behind an `Engine.has_method(...)` runtime guard, cascading to a full plugin-load failure on 4.3 (#476). `Engine.call(...)` is identical at runtime on 4.4+ but invisible to the older parser.
-- **`extends Logger` is 4.5+**: `runtime/editor_logger.gd` / `game_logger.gd` extend `Logger` and are only `load()`-ed behind a `ClassDB.class_exists("Logger")` gate. On < 4.5 they emit a benign `Could not find base class "Logger"` parse error during the editor's filesystem scan (never instantiated, plugin still works). Don't add a third 4.5+-base script without the same gating + comment.
+- **`extends Logger` is 4.5+**: `runtime/loggers/editor_logger.gd` / `game_logger.gd` live in a `.gdignore`'d folder so Godot's editor filesystem scan **never parses them** — no `Could not find base class "Logger"` error on any version. `runtime/logger_loader.gd` (a plain `RefCounted` that parses everywhere) compiles them from source via `FileAccess` + `GDScript.new()` at runtime, only behind a `ClassDB.class_exists("Logger")` gate. The loader must **not** set `script.resource_path` (a 2nd build of the same path collides → red "Another resource is loaded" error on reload). Don't add a new `extends Logger` script anywhere outside `runtime/loggers/` — it'd reintroduce the < 4.5 parse error.
 
 ## Self-update compatibility
 

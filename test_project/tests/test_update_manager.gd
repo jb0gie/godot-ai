@@ -23,6 +23,46 @@ func suite_name() -> String:
 	return "update_manager"
 
 
+# ---- _version_can_self_update (pure / static, #475 gate) ---------------
+
+func test_version_can_self_update_false_below_4_4() -> void:
+	## Godot < 4.4 takes the extract-then-restart path that crashes (#475),
+	## so the in-editor self-update is gated off on those engines.
+	assert_false(McpUpdateManagerScript._version_can_self_update(4, 3),
+		"4.3 must be gated (in-editor self-update disabled)")
+	assert_false(McpUpdateManagerScript._version_can_self_update(4, 0),
+		"4.0 must be gated")
+	assert_false(McpUpdateManagerScript._version_can_self_update(3, 9),
+		"a hypothetical 3.x must be gated")
+
+
+func test_version_can_self_update_true_at_and_above_4_4() -> void:
+	assert_true(McpUpdateManagerScript._version_can_self_update(4, 4),
+		"4.4 is the first engine that can self-update in place")
+	assert_true(McpUpdateManagerScript._version_can_self_update(4, 6),
+		"4.6 can self-update")
+	assert_true(McpUpdateManagerScript._version_can_self_update(5, 0),
+		"a future 5.0 (minor 0) must not be misclassified by the minor check")
+
+
+func test_manual_update_label_includes_version_and_guidance() -> void:
+	## Shown up-front on < 4.4 (before any click) so the user understands the
+	## manual-update flow. Must name the version and the 4.4+ requirement.
+	var with_v := McpUpdateManagerScript._manual_update_label("2.5.7")
+	assert_contains(with_v, "2.5.7", "label must name the available version")
+	assert_contains(with_v, "Godot 4.4+", "label must state the engine requirement")
+	assert_contains(with_v, "addons/godot_ai/", "label must point at the manual-swap path")
+
+
+func test_manual_update_label_omits_version_when_unknown() -> void:
+	## On the click path the version isn't re-threaded; the label degrades to
+	## a generic "Update available" without a stray "v" token.
+	var no_v := McpUpdateManagerScript._manual_update_label("")
+	assert_contains(no_v, "Update available", "generic label must still lead with 'Update available'")
+	assert_false(no_v.contains(" v"), "no version token when version is empty")
+	assert_contains(no_v, "Godot 4.4+", "label must still state the engine requirement")
+
+
 # ---- parse_releases_response (pure / static) ---------------------------
 
 func _make_body(json_str: String) -> PackedByteArray:

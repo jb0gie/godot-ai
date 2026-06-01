@@ -30,6 +30,23 @@ const DEFAULT_TIMEOUT_SEC := 8.0
 ## silent black hole. On CI the game subprocess has been observed
 ## taking ~15s to boot + register.
 const GAME_READY_WAIT_SEC := 20.0
+## #500: how long to wait for the game-side autoload to beacon mcp:hello before
+## issuing a game_eval. This is deliberately MUCH shorter than the 20s
+## screenshot wait above: the eval path's total editor-side budget is this wait
+## plus the 10s eval backstop (request_game_eval's timeout_sec), and that total
+## MUST stay below the 15s game_eval timeout enforced at two layers: the Python
+## server's send_command budget (src/godot_ai/handlers/editor.py::game_eval) and
+## this plugin's own deferred budget (dispatcher.gd's 15000ms game_eval entry,
+## editor/plugin-side — not server-side). Either firing produces the opaque tail.
+## With the 20s screenshot wait, a not-yet-ready game made the editor poll past
+## the 15s deadline, so the server gave up first with an opaque
+## ~15s TimeoutError instead of the actionable "Is the game actually running?"
+## error below ever reaching the client (#500's residual TimeoutError bucket).
+## 3s wait + 10s backstop = 13s, comfortably under the 15s server timeout, so
+## the actionable error always wins. A game launched moments before the eval
+## still has the 3s grace to register; if it needs longer, the user gets a fast,
+## clear "is it running?" rather than a 15s hang.
+const EVAL_READY_WAIT_SEC := 3.0
 ## #490: how long to wait for the game's mcp:eval_compiled beacon before
 ## concluding the eval source failed to compile. A parse error aborts the
 ## game-side handler before it can reply, so without this we'd wait the
@@ -370,6 +387,13 @@ func _clear_pending(request_id: String) -> void:
 ## and its message (the timeout_callable below) is intentionally generic. Drop
 ## timeout_sec at/below 8s and it pre-empts the game's actionable "Eval
 ## exceeded 8s" message — see the TIMEOUT ORDERING note on EVAL_TIMEOUT_SEC.
+##
+## #500: the *not-ready* path adds EVAL_READY_WAIT_SEC (3s) on top of this 10s
+## backstop. That sum (13s) must also stay below the dispatcher/server 15s
+## budget, or a not-yet-ready game makes the server time out opaquely before
+## the editor's actionable error returns — which is exactly the residual ~15s
+## TimeoutError bucket #500 tracked down. Keep EVAL_READY_WAIT_SEC + timeout_sec
+## < 15s if you tune either.
 func request_game_eval(
 	code: String,
 	request_id: String,
@@ -402,12 +426,15 @@ func _wait_then_eval(
 	connection: McpConnection,
 	timeout_sec: float,
 ) -> void:
-	var deadline := Time.get_ticks_msec() + int(GAME_READY_WAIT_SEC * 1000.0)
+	## #500: eval uses EVAL_READY_WAIT_SEC (not the 20s GAME_READY_WAIT_SEC) so
+	## the not-ready path returns its actionable error before the 15s server-side
+	## command timeout fires an opaque TimeoutError. See EVAL_READY_WAIT_SEC.
+	var deadline := Time.get_ticks_msec() + int(EVAL_READY_WAIT_SEC * 1000.0)
 	while not is_game_capture_ready() and Time.get_ticks_msec() < deadline:
 		await tree.process_frame
 	if not is_game_capture_ready():
 		_send_error(connection, request_id, ErrorCodes.INTERNAL_ERROR,
-			"Game-side autoload never registered its debugger capture within %ds. Is the game actually running?" % int(GAME_READY_WAIT_SEC))
+			"Game-side autoload never registered its debugger capture within %ds. Is the game actually running? Start it with project_run / the editor's Play button, then retry. If it IS running, check Project Settings → Autoload for _mcp_game_helper (added automatically when the plugin is enabled)." % int(EVAL_READY_WAIT_SEC))
 		return
 	_send_eval(tree, code, request_id, connection, timeout_sec)
 

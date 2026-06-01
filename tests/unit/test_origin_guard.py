@@ -13,10 +13,12 @@ import pytest
 
 from godot_ai.transport.origin_guard import (
     LocalhostOnlyHTTPMiddleware,
+    bind_host_for_networks,
     evaluate_loopback,
     is_allowed_host,
     is_allowed_origin,
     is_allowed_sec_fetch_site,
+    parse_allow_hosts,
 )
 
 # ---------------------------------------------------------------------------
@@ -439,3 +441,161 @@ def test_middleware_passes_state_attribute_through() -> None:
 
     middleware = LocalhostOnlyHTTPMiddleware(FakeApp())  # type: ignore[arg-type]
     assert middleware.state == "fake-state-marker"
+
+
+# ---------------------------------------------------------------------------
+# --allow-host LAN opt-in (issue #421)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_allow_hosts_cidr_and_bare_ip() -> None:
+    nets = parse_allow_hosts(["192.168.1.0/24", "10.0.0.5"])
+    assert str(nets[0]) == "192.168.1.0/24"
+    # A bare IP becomes a host-route (/32).
+    assert str(nets[1]) == "10.0.0.5/32"
+
+
+def test_parse_allow_hosts_comma_separated_and_repeated() -> None:
+    nets = parse_allow_hosts(["192.168.1.0/24, 10.0.0.0/8", "172.16.0.0/12"])
+    assert [str(n) for n in nets] == ["192.168.1.0/24", "10.0.0.0/8", "172.16.0.0/12"]
+
+
+def test_parse_allow_hosts_empty_is_empty_list() -> None:
+    assert parse_allow_hosts([]) == []
+    assert parse_allow_hosts(["", "  "]) == []
+
+
+def test_parse_allow_hosts_tolerates_host_bits() -> None:
+    # strict=False: a CIDR with host bits set is normalised, not rejected.
+    nets = parse_allow_hosts(["192.168.1.5/24"])
+    assert str(nets[0]) == "192.168.1.0/24"
+
+
+def test_parse_allow_hosts_rejects_garbage() -> None:
+    with pytest.raises(ValueError, match="not-an-ip"):
+        parse_allow_hosts(["not-an-ip"])
+
+
+def test_is_allowed_host_lan_ip_in_network() -> None:
+    nets = parse_allow_hosts(["192.168.1.0/24"])
+    assert is_allowed_host("192.168.1.50:8000", nets) is True
+    assert is_allowed_host("192.168.1.50", nets) is True
+
+
+def test_is_allowed_host_lan_ip_outside_network_rejected() -> None:
+    nets = parse_allow_hosts(["192.168.1.0/24"])
+    assert is_allowed_host("192.168.2.50:8000", nets) is False
+    assert is_allowed_host("10.0.0.1", nets) is False
+
+
+def test_is_allowed_host_loopback_still_passes_with_networks() -> None:
+    nets = parse_allow_hosts(["192.168.1.0/24"])
+    assert is_allowed_host("127.0.0.1:8000", nets) is True
+    assert is_allowed_host("localhost", nets) is True
+
+
+def test_is_allowed_host_dns_name_never_matches_network() -> None:
+    # A DNS name (the rebinding shape) never parses to an IP, so it can't
+    # slip into an allowed network even if that name resolves there.
+    nets = parse_allow_hosts(["192.168.1.0/24"])
+    assert is_allowed_host("attacker.example.com:8000", nets) is False
+
+
+def test_is_allowed_host_bracketed_ipv6_in_network() -> None:
+    # A bracketed IPv6 Host literal is unwrapped and matched against an IPv6
+    # CIDR; one outside the range is rejected.
+    nets = parse_allow_hosts(["fd00::/8"])
+    assert is_allowed_host("[fd00::1]:8000", nets) is True
+    assert is_allowed_host("[fd00::1]", nets) is True
+    assert is_allowed_host("[2001:db8::1]:8000", nets) is False
+
+
+def test_is_allowed_host_without_networks_unchanged() -> None:
+    # Default (None) is byte-for-byte loopback-only.
+    assert is_allowed_host("192.168.1.50:8000") is False
+    assert is_allowed_host("192.168.1.50:8000", None) is False
+
+
+def test_evaluate_loopback_native_lan_agent_passes() -> None:
+    nets = parse_allow_hosts(["192.168.1.0/24"])
+    # Native remote agent: LAN Host, no Origin, no Sec-Fetch-Site.
+    assert evaluate_loopback(["192.168.1.50:8000"], [], [], nets) is True
+
+
+def test_evaluate_loopback_lan_browser_origin_rejected() -> None:
+    """The opt-in widens Host only — a browser on the LAN still sends a
+    non-loopback Origin and is rejected, preserving rebinding defense."""
+    nets = parse_allow_hosts(["192.168.1.0/24"])
+    assert (
+        evaluate_loopback(
+            ["192.168.1.50:8000"],
+            ["http://192.168.1.50:8000"],
+            [],
+            nets,
+        )
+        is False
+    )
+
+
+def test_evaluate_loopback_lan_cross_site_subresource_rejected() -> None:
+    nets = parse_allow_hosts(["192.168.1.0/24"])
+    assert evaluate_loopback(["192.168.1.50:8000"], [], ["cross-site"], nets) is False
+
+
+async def test_middleware_allows_lan_host_when_opted_in() -> None:
+    nets = parse_allow_hosts(["192.168.1.0/24"])
+    middleware = LocalhostOnlyHTTPMiddleware(app=None, allowed_networks=nets)  # type: ignore[arg-type]
+    sent, inner_called = await _call_middleware(
+        middleware,
+        headers=[(b"host", b"192.168.1.50:8000")],
+    )
+    assert inner_called is True
+    assert sent[0]["status"] == 200
+
+
+async def test_middleware_rejects_lan_host_browser_origin_when_opted_in() -> None:
+    nets = parse_allow_hosts(["192.168.1.0/24"])
+    middleware = LocalhostOnlyHTTPMiddleware(app=None, allowed_networks=nets)  # type: ignore[arg-type]
+    sent, inner_called = await _call_middleware(
+        middleware,
+        headers=[
+            (b"host", b"192.168.1.50:8000"),
+            (b"origin", b"http://192.168.1.50:8000"),
+        ],
+    )
+    assert inner_called is False
+    assert sent[0]["status"] == 403
+
+
+async def test_middleware_rejects_lan_host_without_opt_in() -> None:
+    # Default middleware (no networks) keeps rejecting LAN hosts.
+    middleware = LocalhostOnlyHTTPMiddleware(app=None)  # type: ignore[arg-type]
+    sent, inner_called = await _call_middleware(
+        middleware,
+        headers=[(b"host", b"192.168.1.50:8000")],
+    )
+    assert inner_called is False
+    assert sent[0]["status"] == 403
+
+
+def test_bind_host_for_networks_none_keeps_loopback_default() -> None:
+    # No opt-in → None so callers keep their loopback default.
+    assert bind_host_for_networks(None) is None
+    assert bind_host_for_networks([]) is None
+
+
+def test_bind_host_for_networks_ipv4_only() -> None:
+    assert bind_host_for_networks(parse_allow_hosts(["192.168.1.0/24"])) == "0.0.0.0"
+
+
+def test_bind_host_for_networks_ipv6_only() -> None:
+    # An IPv6-only allowlist binds "::" (no IPv4 range to serve).
+    assert bind_host_for_networks(parse_allow_hosts(["fd00::/8"])) == "::"
+
+
+def test_bind_host_for_networks_prioritizes_ipv4_reachability() -> None:
+    # Any IPv4 in the allowlist → "0.0.0.0", so IPv4 stays reachable on every
+    # platform (incl. Windows v6-only). A mixed allowlist must NOT bind "::"
+    # and silently drop IPv4 reachability. See bind_host_for_networks docstring.
+    assert bind_host_for_networks(parse_allow_hosts(["192.168.1.0/24", "fd00::/8"])) == "0.0.0.0"
+    assert bind_host_for_networks(parse_allow_hosts(["fd00::/8", "10.0.0.0/8"])) == "0.0.0.0"

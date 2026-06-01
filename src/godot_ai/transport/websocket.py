@@ -113,6 +113,13 @@ class GodotWebSocketServer:
         try:
             async with websockets.serve(
                 self._handle_connection,
+                # Always loopback. The WS channel is the *local* Python-server↔
+                # Godot-editor bridge; the editor connects via ws://127.0.0.1
+                # (plugin connection.gd). Remote agents reach us over HTTP only,
+                # so --allow-host (#421) must NOT widen this port — that would
+                # expose the unauthenticated plugin WS to the LAN, and binding
+                # "::" (IPv6-only by default on Windows) would break the editor's
+                # IPv4 loopback connection.
                 "127.0.0.1",
                 self.port,
                 max_size=4 * 1024 * 1024,  # 4 MB for screenshot base64

@@ -163,10 +163,12 @@ def test_main_plumbs_pid_file_into_runtime_info(monkeypatch, tmp_path):
         def run(self, **kwargs):
             captured["run_kwargs"] = kwargs
 
-    monkeypatch.setattr(
-        "godot_ai.server.create_server",
-        lambda ws_port, *, exclude_domains=None, owner_pid=None: StubServer(),
-    )
+    def _fake_create_server(
+        ws_port, *, exclude_domains=None, owner_pid=None, allow_host_networks=None
+    ):
+        return StubServer()
+
+    monkeypatch.setattr("godot_ai.server.create_server", _fake_create_server)
 
     import godot_ai
 

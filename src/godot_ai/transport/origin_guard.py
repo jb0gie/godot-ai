@@ -40,11 +40,15 @@ See umbrella #343, finding #1 (audit-v2).
 
 from __future__ import annotations
 
+import ipaddress
+from collections.abc import Iterable, Sequence
 from http import HTTPStatus
 from typing import Any
 from urllib.parse import urlsplit
 
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 LOOPBACK_HOSTNAMES: frozenset[str] = frozenset({"127.0.0.1", "localhost", "[::1]"})
 LOOPBACK_ORIGIN_SCHEMES: frozenset[str] = frozenset({"http", "https", "ws", "wss"})
@@ -85,16 +89,95 @@ def _normalise_host(host: str) -> str:
     return normalised
 
 
-def is_allowed_host(host_header: str | None) -> bool:
-    """Whether ``host_header`` resolves to a loopback name.
+def parse_allow_hosts(values: Iterable[str]) -> list[IPNetwork]:
+    """Parse ``--allow-host`` CLI values into IP networks (issue #421).
+
+    Each value may be a CIDR (``192.168.1.0/24``), a bare IP
+    (``192.168.1.50`` → a /32 or /128), or a comma-separated list of
+    either. ``host_bits`` set on a CIDR are tolerated (``strict=False``)
+    so ``192.168.1.5/24`` is accepted as ``192.168.1.0/24``. Raises
+    ``ValueError`` (with the offending token) on anything unparseable so
+    a typo fails loudly at startup instead of silently exposing nothing.
+    """
+    networks: list[IPNetwork] = []
+    for raw in values:
+        for token in str(raw).split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                networks.append(ipaddress.ip_network(token, strict=False))
+            except ValueError as exc:
+                raise ValueError(f"invalid --allow-host value {token!r}: {exc}") from exc
+    return networks
+
+
+def bind_host_for_networks(networks: Sequence[IPNetwork] | None) -> str | None:
+    """HTTP bind address that exposes the transport to ``networks`` (issue #421).
+
+    Returns ``None`` when no networks are named so the caller keeps its
+    loopback default (the byte-for-byte unchanged path).
+
+    Otherwise **prioritizes IPv4 reachability**: if the allowlist contains
+    *any* IPv4 network we bind ``"0.0.0.0"`` (IPv4 all-interfaces, reachable
+    on every platform), and only bind ``"::"`` when the allowlist is
+    *exclusively* IPv6. This avoids the non-portable assumption that ``"::"``
+    yields a dual-stack listener — it does on Linux (``bindv6only=0``) but
+    sockets are IPv6-only by default on Windows, where binding ``"::"`` would
+    make an IPv4 range in the allowlist unreachable. The trade-off: an
+    allowlist that *mixes* IPv4 and IPv6 is served over IPv4 only (its IPv6
+    ranges won't be reachable over IPv6). That's the safe default — LAN MCP is
+    overwhelmingly IPv4, and IPv4 reachability is preserved everywhere. A
+    dual-stack / separate-listener setup for mixed allowlists can come later
+    if needed.
+    """
+    if not networks:
+        return None
+    if any(isinstance(net, ipaddress.IPv4Network) for net in networks):
+        return "0.0.0.0"  # noqa: S104 — opt-in; the guard still gates every request
+    return "::"  # noqa: S104 — allowlist is IPv6-only, no IPv4 to serve
+
+
+def _host_ip_in_networks(host_header: str, networks: Sequence[IPNetwork] | None) -> bool:
+    """Whether the Host header's IP literal falls inside one of ``networks``.
+
+    Only IP literals match — a DNS name (the shape a rebinding attack
+    presents) never parses to an address, so it can't slip into an
+    allowed network. Bracketed IPv6 (``[192.168..]`` form) is unwrapped
+    by ``_normalise_host`` first.
+    """
+    if not networks:
+        return False
+    candidate = _normalise_host(host_header.strip())
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    try:
+        ip = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    return any(ip in net for net in networks)
+
+
+def is_allowed_host(
+    host_header: str | None,
+    allowed_networks: Sequence[IPNetwork] | None = None,
+) -> bool:
+    """Whether ``host_header`` resolves to a loopback name (or an allowed LAN IP).
 
     Empty or missing returns False — a properly formed HTTP/1.1 request
     always carries a Host header, and refusing the request is safer than
     guessing. The WebSocket guard mirrors this.
+
+    When ``allowed_networks`` is supplied (the ``--allow-host`` opt-in,
+    #421), a Host header whose IP literal falls inside one of those
+    networks is also accepted. ``allowed_networks=None`` (the default)
+    is byte-for-byte the original loopback-only behavior.
     """
     if not host_header:
         return False
-    return _normalise_host(host_header.strip()) in LOOPBACK_HOSTNAMES
+    if _normalise_host(host_header.strip()) in LOOPBACK_HOSTNAMES:
+        return True
+    return _host_ip_in_networks(host_header, allowed_networks)
 
 
 def is_allowed_origin(origin_header: str | None) -> bool:
@@ -146,6 +229,7 @@ def evaluate_loopback(
     hosts: list[str],
     origins: list[str],
     sec_fetch_sites: list[str] | None = None,
+    allowed_networks: Sequence[IPNetwork] | None = None,
 ) -> bool:
     """Return True iff the request's headers pass the allowlist.
 
@@ -155,6 +239,13 @@ def evaluate_loopback(
     the Sec-Fetch-Site cross-origin reject rule are evaluated identically.
     A divergence between the two transports would be a security
     regression — this helper exists to prevent it.
+
+    ``allowed_networks`` (the ``--allow-host`` opt-in, #421) only widens
+    the *Host* allowlist to named LAN CIDRs. The Origin and Sec-Fetch-Site
+    rules are deliberately left untouched: a browser on the LAN sends a
+    non-loopback Origin (rejected) and a foreign Sec-Fetch-Site (rejected),
+    so DNS-rebinding defense survives the opt-in. A native remote agent
+    sends neither header, so it passes once its Host IP is allowed.
     """
     if len(hosts) > 1 or len(origins) > 1:
         return False
@@ -164,7 +255,7 @@ def evaluate_loopback(
     origin = origins[0] if origins else None
     sec_fetch_site = sec_fetch_sites[0] if sec_fetch_sites else None
     return (
-        is_allowed_host(host)
+        is_allowed_host(host, allowed_networks)
         and is_allowed_origin(origin)
         and is_allowed_sec_fetch_site(sec_fetch_site)
     )
@@ -178,8 +269,14 @@ class LocalhostOnlyHTTPMiddleware:
     before any inner middleware. Non-HTTP scopes (lifespan) pass through.
     """
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        allowed_networks: Sequence[IPNetwork] | None = None,
+    ) -> None:
         self.app = app
+        # #421: empty/None keeps the loopback-only behavior byte-for-byte.
+        self.allowed_networks = list(allowed_networks) if allowed_networks else None
 
     def __getattr__(self, name: str) -> Any:
         # Mirror StaleMcpSessionDiagnosticMiddleware: FastMCP / uvicorn
@@ -203,7 +300,7 @@ class LocalhostOnlyHTTPMiddleware:
             elif key == b"sec-fetch-site":
                 sec_fetch_sites.append(raw_value.decode("latin-1"))
 
-        if evaluate_loopback(hosts, origins, sec_fetch_sites):
+        if evaluate_loopback(hosts, origins, sec_fetch_sites, self.allowed_networks):
             await self.app(scope, receive, send)
             return
         await _send_forbidden(send)
@@ -223,7 +320,7 @@ async def _send_forbidden(send: Send) -> None:
     await send({"type": "http.response.body", "body": FORBIDDEN_BODY, "more_body": False})
 
 
-def make_websocket_request_guard():
+def make_websocket_request_guard(allowed_networks: Sequence[IPNetwork] | None = None):
     """Return a ``process_request`` hook for ``websockets.asyncio.server.serve``.
 
     The hook fires before the WebSocket upgrade. When Host or Origin
@@ -231,7 +328,12 @@ def make_websocket_request_guard():
     ``connection.respond(...)``; returning that response from
     ``process_request`` aborts the upgrade without ever creating a
     Session.
+
+    ``allowed_networks`` (the ``--allow-host`` opt-in, #421) widens the
+    Host allowlist identically to the HTTP middleware so the two
+    transports never diverge.
     """
+    networks = list(allowed_networks) if allowed_networks else None
 
     async def guard(connection, request):
         ## Use ``get_all`` so a smuggled duplicate (two ``Host:`` lines)
@@ -240,7 +342,7 @@ def make_websocket_request_guard():
         hosts = list(request.headers.get_all("Host"))
         origins = list(request.headers.get_all("Origin"))
         sec_fetch_sites = list(request.headers.get_all("Sec-Fetch-Site"))
-        if evaluate_loopback(hosts, origins, sec_fetch_sites):
+        if evaluate_loopback(hosts, origins, sec_fetch_sites, networks):
             return None
         return connection.respond(HTTPStatus.FORBIDDEN, FORBIDDEN_BODY_TEXT)
 

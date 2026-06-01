@@ -15,6 +15,10 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 DEV_TRANSPORT_ENV = "GODOT_AI_DEV_TRANSPORT"
 DEV_WS_PORT_ENV = "GODOT_AI_DEV_WS_PORT"
 DEV_EXCLUDE_DOMAINS_ENV = "GODOT_AI_DEV_EXCLUDE_DOMAINS"
+## #421: reload runs the app in a uvicorn-supervised subprocess via the
+## ``create_app`` factory, so --allow-host CIDRs ride through as an env var
+## (the comma-joined CIDR strings) rather than a function argument.
+DEV_ALLOW_HOST_ENV = "GODOT_AI_DEV_ALLOW_HOST"
 RELOADABLE_TRANSPORTS = {"sse", "streamable-http"}
 
 STALE_MCP_SESSION_MESSAGE = (
@@ -157,9 +161,17 @@ def create_app():
     """Create the FastMCP ASGI app for uvicorn's reload supervisor."""
     from godot_ai.server import create_server
     from godot_ai.tools.domains import parse_exclude_list
+    from godot_ai.transport.origin_guard import parse_allow_hosts
 
     exclude_domains = parse_exclude_list(os.environ.get(DEV_EXCLUDE_DOMAINS_ENV, ""))
-    server = create_server(ws_port=_get_dev_ws_port(), exclude_domains=exclude_domains)
+    allow_host_networks = parse_allow_hosts(
+        [v for v in os.environ.get(DEV_ALLOW_HOST_ENV, "").split(",") if v]
+    )
+    server = create_server(
+        ws_port=_get_dev_ws_port(),
+        exclude_domains=exclude_domains,
+        allow_host_networks=allow_host_networks,
+    )
     return server.http_app(transport=_get_dev_transport())
 
 
@@ -169,6 +181,7 @@ def run_with_reload(
     port: int,
     ws_port: int,
     exclude_domains: set[str] | None = None,
+    allow_host_networks: list | None = None,
 ) -> None:
     """Run the HTTP transport through uvicorn's supported reload path."""
     if transport not in RELOADABLE_TRANSPORTS:
@@ -177,12 +190,20 @@ def run_with_reload(
     os.environ[DEV_TRANSPORT_ENV] = transport
     os.environ[DEV_WS_PORT_ENV] = str(ws_port)
     os.environ[DEV_EXCLUDE_DOMAINS_ENV] = ",".join(sorted(exclude_domains or set()))
+    ## #421: pass the CIDRs to the factory subprocess as their string forms.
+    os.environ[DEV_ALLOW_HOST_ENV] = ",".join(str(net) for net in (allow_host_networks or []))
+
+    ## Bind off loopback only when an allowlist is named; the guard (rebuilt
+    ## inside create_app from the same env) still gates every request.
+    from godot_ai.transport.origin_guard import bind_host_for_networks
+
+    bind_host = bind_host_for_networks(allow_host_networks) or fastmcp.settings.host
 
     src_dir = str(Path(__file__).resolve().parent.parent)
     uvicorn.run(
         "godot_ai.asgi:create_app",
         factory=True,
-        host=fastmcp.settings.host,
+        host=bind_host,
         port=port,
         log_level=fastmcp.settings.log_level.lower(),
         timeout_graceful_shutdown=2,

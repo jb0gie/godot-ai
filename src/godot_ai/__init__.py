@@ -86,6 +86,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--allow-host",
+        action="append",
+        metavar="CIDR",
+        default=None,
+        help=(
+            "Expose the server to a named LAN range for remote agents (issue "
+            "#421). Takes a CIDR or bare IP (repeatable, or comma-separated), "
+            "e.g. --allow-host 192.168.1.0/24. When set, both transports bind "
+            "off loopback and the rebinding guard widens its Host allowlist to "
+            "these networks ONLY — browser Origin / Sec-Fetch-Site checks stay "
+            "on. Omit for the default loopback-only behavior. Prefer an SSH "
+            "tunnel / Tailscale on untrusted networks; only name ranges you trust."
+        ),
+    )
+    parser.add_argument(
         "--exclude-domains",
         default="",
         help=(
@@ -104,6 +119,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         exclude_domains = parse_exclude_list(args.exclude_domains)
     except ValueError as exc:
         parser.error(str(exc))
+
+    ## #421: parse --allow-host CIDRs. A typo here fails loudly at startup
+    ## rather than silently binding loopback-only (or worse, wide open).
+    from godot_ai.transport.origin_guard import bind_host_for_networks, parse_allow_hosts
+
+    try:
+        allow_host_networks = parse_allow_hosts(args.allow_host or [])
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    ## Widen the HTTP bind off loopback only when an allowlist is named. The
+    ## DNS-rebinding guard still gates every request by the CIDR(s); binding
+    ## off loopback without the guard would be the footgun this flag avoids.
+    if allow_host_networks and args.transport in ("sse", "streamable-http"):
+        import fastmcp
+
+        fastmcp.settings.host = bind_host_for_networks(allow_host_networks)
 
     from godot_ai.runtime_info import install_pid_file
 
@@ -129,6 +161,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             port=args.port,
             ws_port=args.ws_port,
             exclude_domains=exclude_domains,
+            allow_host_networks=allow_host_networks,
         )
         return
 
@@ -138,6 +171,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ws_port=args.ws_port,
         exclude_domains=exclude_domains,
         owner_pid=owner_pid,
+        allow_host_networks=allow_host_networks,
     )
 
     transport_kwargs = {}

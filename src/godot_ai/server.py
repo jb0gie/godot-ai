@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,7 +64,7 @@ from godot_ai.tools.signal import register_signal_tools
 from godot_ai.tools.testing import register_testing_tools
 from godot_ai.tools.theme import register_theme_tools
 from godot_ai.tools.ui import register_ui_tools
-from godot_ai.transport.origin_guard import LocalhostOnlyHTTPMiddleware
+from godot_ai.transport.origin_guard import IPNetwork, LocalhostOnlyHTTPMiddleware
 from godot_ai.transport.websocket import GodotWebSocketServer
 
 logger = logging.getLogger(__name__)
@@ -96,8 +96,9 @@ class GodotAIFastMCP(FastMCP):
         ## Outermost wrap: refuse non-loopback Host/Origin (DNS-rebinding
         ## guard, audit-v2 finding #1). Applied to every HTTP transport
         ## including ``sse`` so ``/godot-ai/status`` and the FastMCP
-        ## endpoints are guarded uniformly.
-        return LocalhostOnlyHTTPMiddleware(app)
+        ## endpoints are guarded uniformly. ``--allow-host`` (#421) widens
+        ## only the Host allowlist to named LAN CIDRs; None = loopback-only.
+        return LocalhostOnlyHTTPMiddleware(app, getattr(self, "_allow_host_networks", None))
 
 
 def create_server(
@@ -105,6 +106,7 @@ def create_server(
     *,
     exclude_domains: Iterable[str] | None = None,
     owner_pid: int | None = None,
+    allow_host_networks: Sequence[IPNetwork] | None = None,
 ) -> FastMCP:
     logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
 
@@ -112,6 +114,10 @@ def create_server(
     @asynccontextmanager
     async def _lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         registry = SessionRegistry()
+        ## The WS server is intentionally loopback-only even under --allow-host
+        ## (#421): it's the local editor↔server bridge, not a remote surface.
+        ## See GodotWebSocketServer.start for the rationale (LAN exposure +
+        ## Windows IPv6-only breakage).
         ws_server = GodotWebSocketServer(registry, port=ws_port)
         client = GodotClient(ws_server, registry)
 
@@ -251,6 +257,10 @@ def create_server(
         ),
         lifespan=_lifespan,
     )
+
+    ## #421: stash the --allow-host CIDRs where http_app() reads them when it
+    ## installs the rebinding guard middleware. None = loopback-only (default).
+    mcp._allow_host_networks = list(allow_host_networks) if allow_host_networks else None
 
     ## Middleware registration order is load-bearing — do not reorder
     ## without reading the rationale below. Locked by

@@ -28,7 +28,7 @@ def test_create_app_uses_env_config(monkeypatch):
     server = StubServer(app)
     calls: dict[str, object] = {}
 
-    def fake_create_server(ws_port: int, *, exclude_domains=None):
+    def fake_create_server(ws_port: int, *, exclude_domains=None, allow_host_networks=None):
         calls["ws_port"] = ws_port
         calls["exclude_domains"] = exclude_domains
         return server
@@ -108,6 +108,7 @@ def test_main_uses_reloadable_runner_for_http_reload(monkeypatch):
         "port": 8123,
         "ws_port": 9555,
         "exclude_domains": set(),
+        "allow_host_networks": [],
     }
 
 
@@ -115,7 +116,9 @@ def test_main_runs_server_directly_without_reload(monkeypatch):
     server = StubServer(app=None)
     calls: dict[str, object] = {}
 
-    def fake_create_server(ws_port: int, *, exclude_domains=None, owner_pid=None):
+    def fake_create_server(
+        ws_port: int, *, exclude_domains=None, owner_pid=None, allow_host_networks=None
+    ):
         calls["ws_port"] = ws_port
         calls["exclude_domains"] = exclude_domains
         calls["owner_pid"] = owner_pid
@@ -136,7 +139,9 @@ def test_main_forwards_exclude_domains_to_create_server(monkeypatch):
     server = StubServer(app=None)
     calls: dict[str, object] = {}
 
-    def fake_create_server(ws_port: int, *, exclude_domains=None, owner_pid=None):
+    def fake_create_server(
+        ws_port: int, *, exclude_domains=None, owner_pid=None, allow_host_networks=None
+    ):
         calls["exclude_domains"] = exclude_domains
         return server
 
@@ -155,11 +160,89 @@ def test_main_forwards_exclude_domains_to_create_server(monkeypatch):
     assert calls["exclude_domains"] == {"audio", "particle", "theme"}
 
 
+def test_main_plumbs_allow_host_into_create_server(monkeypatch):
+    """--allow-host CIDRs reach create_server as parsed networks (#421)."""
+    server = StubServer(app=None)
+    calls: dict[str, object] = {}
+
+    def fake_create_server(
+        ws_port: int, *, exclude_domains=None, owner_pid=None, allow_host_networks=None
+    ):
+        calls["allow_host_networks"] = allow_host_networks
+        return server
+
+    monkeypatch.setattr("godot_ai.server.create_server", fake_create_server)
+
+    godot_ai.main(
+        ["--transport", "stdio", "--allow-host", "192.168.1.0/24", "--allow-host", "10.0.0.5"]
+    )
+
+    assert [str(n) for n in calls["allow_host_networks"]] == ["192.168.1.0/24", "10.0.0.5/32"]
+
+
+def test_main_widens_http_bind_only_when_allow_host_set(monkeypatch):
+    """The HTTP bind widens to 0.0.0.0 only with --allow-host on an HTTP
+    transport; the guard (rebuilt with the same CIDRs) still gates requests."""
+    import fastmcp
+
+    monkeypatch.setattr("godot_ai.server.create_server", lambda **kw: StubServer(app=None))
+    monkeypatch.setattr(fastmcp.settings, "host", "127.0.0.1")
+
+    godot_ai.main(
+        ["--transport", "streamable-http", "--port", "8123", "--allow-host", "192.168.1.0/24"]
+    )
+    assert fastmcp.settings.host == "0.0.0.0"
+
+
+def test_main_does_not_widen_bind_without_allow_host(monkeypatch):
+    import fastmcp
+
+    monkeypatch.setattr("godot_ai.server.create_server", lambda **kw: StubServer(app=None))
+    monkeypatch.setattr(fastmcp.settings, "host", "127.0.0.1")
+
+    godot_ai.main(["--transport", "streamable-http", "--port", "8123"])
+    assert fastmcp.settings.host == "127.0.0.1"
+
+
+def test_main_rejects_invalid_allow_host(monkeypatch):
+    monkeypatch.setattr("godot_ai.server.create_server", lambda **kw: StubServer(app=None))
+    with pytest.raises(SystemExit):
+        godot_ai.main(["--transport", "stdio", "--allow-host", "not-a-cidr"])
+
+
+def test_run_with_reload_plumbs_allow_host_env_and_widens_bind(monkeypatch):
+    """Reload path passes CIDRs to the factory subprocess via env and binds
+    0.0.0.0 (#421)."""
+    import os
+
+    captured: dict[str, object] = {}
+
+    def fake_run(app, **kwargs):
+        captured["host"] = kwargs.get("host")
+
+    monkeypatch.setattr(asgi.uvicorn, "run", fake_run)
+    # setenv (not direct write) so pytest restores it for later tests.
+    monkeypatch.setenv(asgi.DEV_ALLOW_HOST_ENV, "")
+    from godot_ai.transport.origin_guard import parse_allow_hosts
+
+    asgi.run_with_reload(
+        transport="streamable-http",
+        port=8000,
+        ws_port=9500,
+        allow_host_networks=parse_allow_hosts(["192.168.1.0/24"]),
+    )
+
+    assert os.environ[asgi.DEV_ALLOW_HOST_ENV] == "192.168.1.0/24"
+    assert captured["host"] == "0.0.0.0"
+
+
 def test_main_plumbs_owner_pid_from_flag(monkeypatch):
     server = StubServer(app=None)
     calls: dict[str, object] = {}
 
-    def fake_create_server(ws_port: int, *, exclude_domains=None, owner_pid=None):
+    def fake_create_server(
+        ws_port: int, *, exclude_domains=None, owner_pid=None, allow_host_networks=None
+    ):
         calls["owner_pid"] = owner_pid
         return server
 
@@ -175,7 +258,9 @@ def test_main_plumbs_owner_pid_from_env(monkeypatch):
     server = StubServer(app=None)
     calls: dict[str, object] = {}
 
-    def fake_create_server(ws_port: int, *, exclude_domains=None, owner_pid=None):
+    def fake_create_server(
+        ws_port: int, *, exclude_domains=None, owner_pid=None, allow_host_networks=None
+    ):
         calls["owner_pid"] = owner_pid
         return server
 
@@ -191,7 +276,9 @@ def test_main_ignores_malformed_owner_pid_env(monkeypatch):
     server = StubServer(app=None)
     calls: dict[str, object] = {}
 
-    def fake_create_server(ws_port: int, *, exclude_domains=None, owner_pid=None):
+    def fake_create_server(
+        ws_port: int, *, exclude_domains=None, owner_pid=None, allow_host_networks=None
+    ):
         calls["owner_pid"] = owner_pid
         return server
 

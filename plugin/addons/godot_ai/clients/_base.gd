@@ -120,10 +120,27 @@ func resolved_config_path() -> String:
 	return McpPathTemplate.resolve(path_template)
 
 
+## True when a CLI client also declares where its config file lives, so it can
+## fall back to writing that file directly when the CLI binary isn't on PATH.
+## #463: Claude Code installed only as a VS Code / Cursor extension exposes no
+## `claude` binary, but `claude mcp add --scope user` just writes `mcpServers`
+## into ~/.claude.json — so we can produce the same entry ourselves.
+func has_json_fallback() -> bool:
+	return config_type == "cli" and not path_template.is_empty() and not server_key_path.is_empty()
+
+
 ## True if the user appears to have this client installed locally.
 func is_installed() -> bool:
 	if config_type == "cli":
-		return not McpCliFinder.find(_array_from_packed(cli_names)).is_empty()
+		if not McpCliFinder.find(_array_from_packed(cli_names)).is_empty():
+			return true
+		# CLI not on PATH. A cli client with a JSON fallback (Claude Code as a
+		# VS Code/Cursor extension, #463) still counts as installed if its
+		# fallback config file already exists.
+		if has_json_fallback():
+			var cfg := resolved_config_path()
+			return not cfg.is_empty() and FileAccess.file_exists(cfg)
+		return false
 	for p in detect_paths:
 		var resolved := McpPathTemplate.expand(p)
 		if not resolved.is_empty() and (FileAccess.file_exists(resolved) or DirAccess.dir_exists_absolute(resolved)):

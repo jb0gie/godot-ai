@@ -715,6 +715,90 @@ func test_json_strategy_round_trip() -> void:
 	assert_eq(McpJsonStrategy.check_status(client, "godot-ai", "http://127.0.0.1:8000/mcp"), McpClient.Status.NOT_CONFIGURED)
 
 
+## #463: a CLI client (Claude Code) installed only as a VS Code/Cursor
+## extension has no `claude` binary on PATH. With a JSON fallback declared,
+## Configure/Remove/status must route through the config file directly.
+func _make_cli_json_fallback_client(path: String) -> McpClient:
+	var c := McpClient.new()
+	c.id = "cli_fallback_test"
+	c.display_name = "CLI Fallback Test"
+	c.config_type = "cli"
+	# A binary name that will never resolve on PATH, forcing the fallback.
+	c.cli_names = PackedStringArray(["godot-ai-nonexistent-cli-xyz"])
+	c.cli_register_template = PackedStringArray(["mcp", "add", "{name}", "{url}"])
+	c.cli_unregister_template = PackedStringArray(["mcp", "remove", "{name}"])
+	c.path_template = {"darwin": path, "windows": path, "linux": path, "unix": path}
+	c.server_key_path = PackedStringArray(["mcpServers"])
+	c.entry_extra_fields = {"type": "http"}
+	return c
+
+
+func test_has_json_fallback_semantics() -> void:
+	var path := _scratch_dir.path_join("fallback_sem.json")
+	var with_fallback := _make_cli_json_fallback_client(path)
+	assert_true(with_fallback.has_json_fallback(), "cli client with path_template + server_key_path should report a JSON fallback")
+	var no_path := _make_cli_json_fallback_client(path)
+	no_path.path_template = {}
+	assert_false(no_path.has_json_fallback(), "cli client without path_template should not report a JSON fallback")
+	# JSON-config clients are not "cli fallbacks".
+	assert_false(_make_test_json_client(path).has_json_fallback(), "a plain json client should not report a cli JSON fallback")
+
+
+func test_claude_code_has_claude_json_fallback() -> void:
+	var client := McpClientRegistry.get_by_id("claude_code")
+	assert_true(client != null, "claude_code must be registered")
+	assert_eq(client.config_type, "cli")
+	assert_true(client.has_json_fallback(), "claude_code should declare a ~/.claude.json fallback (#463)")
+	assert_eq(client.server_key_path.size(), 1)
+	assert_eq(client.server_key_path[0], "mcpServers")
+	assert_eq(client.entry_extra_fields.get("type"), "http", "claude mcp add --transport http writes type:http")
+	assert_true(client.resolved_config_path().ends_with(".claude.json"), "fallback path should be ~/.claude.json, got %s" % client.resolved_config_path())
+
+
+func test_claude_code_manual_command_shows_json_fallback() -> void:
+	# The CLI form is still the primary hint, but a user without the `claude`
+	# binary (VS Code extension) needs the ~/.claude.json edit too (#463).
+	var cmd := McpClientConfigurator.manual_command("claude_code")
+	assert_contains(cmd, "claude mcp add", "manual command should still show the CLI form")
+	assert_contains(cmd, ".claude.json", "manual command should also show the JSON fallback path")
+	assert_contains(cmd, "\"type\": \"http\"", "JSON fallback should show the type:http entry shape")
+
+
+func test_cli_fallback_dispatch_writes_json_when_binary_missing() -> void:
+	var path := _scratch_dir.path_join("cli_fallback.json")
+	_remove_if_exists(path)
+	# Pre-seed an unrelated server that must survive the fallback write.
+	var seed := {"mcpServers": {"someone-else": {"url": "http://other/"}}}
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string(JSON.stringify(seed))
+	f.close()
+
+	var client := _make_cli_json_fallback_client(path)
+	# The bogus cli_names never resolve, so dispatch must take the JSON fallback.
+	var result := McpClientConfigurator._dispatch_configure(client, "http://127.0.0.1:8000/mcp")
+	assert_eq(result.get("status"), "ok", "fallback configure should succeed: %s" % result.get("message", ""))
+
+	var status := McpClientConfigurator._dispatch_check_status_with_cli_path_details(client, "http://127.0.0.1:8000/mcp", "")
+	assert_eq(status.get("status"), McpClient.Status.CONFIGURED, "fallback-configured entry should read CONFIGURED")
+
+	# The written entry carries type:http + url, and the other server survives.
+	var read_file := FileAccess.open(path, FileAccess.READ)
+	var json := JSON.new()
+	assert_eq(json.parse(read_file.get_as_text()), OK)
+	read_file.close()
+	var servers: Dictionary = json.data["mcpServers"]
+	assert_true(servers.has("someone-else"), "unrelated server entry must be preserved")
+	var entry: Dictionary = servers["godot-ai"]
+	assert_eq(entry.get("type"), "http", "fallback entry should pin type:http")
+	assert_eq(entry.get("url"), "http://127.0.0.1:8000/mcp")
+
+	# Remove also goes through the fallback so the entry stays removable.
+	var removed := McpClientConfigurator._dispatch_remove(client)
+	assert_eq(removed.get("status"), "ok")
+	var after := McpClientConfigurator._dispatch_check_status_with_cli_path_details(client, "http://127.0.0.1:8000/mcp", "")
+	assert_eq(after.get("status"), McpClient.Status.NOT_CONFIGURED, "removed fallback entry should read NOT_CONFIGURED")
+
+
 func test_json_strategy_preserves_other_servers() -> void:
 	var path := _scratch_dir.path_join("preserve.json")
 	# Pre-seed the file with another server entry that must survive.

@@ -79,15 +79,24 @@ def test_script_handler_uses_path_validator_at_every_entry_point() -> None:
         'script_handler.gd must not contain bare `begins_with("res://")` '
         "checks — replace with McpPathValidator.validate_resource_path."
     )
-    # Each listed entry point (issue #347) calls the validator.
-    for func_name in ("create_script", "read_script", "patch_script", "find_symbols"):
+    # Each listed entry point (issue #347 + attach_script) calls the validator.
+    # attach_script is included so a regression where it stops validating its
+    # path is caught (Copilot review on #546).
+    for func_name in (
+        "create_script",
+        "read_script",
+        "patch_script",
+        "attach_script",
+        "find_symbols",
+    ):
         assert f"func {func_name}" in source, f"{func_name} missing from script_handler"
-    # The validator helper is referenced — surface area covers all four entry
-    # points; counting calls catches a partial revert.
-    validator_calls = source.count("McpPathValidator.validate_resource_path")
-    assert validator_calls >= 4, (
-        f"script_handler.gd should call McpPathValidator.validate_resource_path "
-        f"at least 4 times (create_script, read_script, patch_script, find_symbols); "
+    # Handlers delegate via path_error / loadable_error / validate_resource_path
+    # — count any McpPathValidator. reference so the wrapper refactor still pins
+    # that every one of the five entry points goes through the validator.
+    validator_calls = source.count("McpPathValidator.")
+    assert validator_calls >= 5, (
+        f"script_handler.gd should delegate to McpPathValidator at least 5 times "
+        f"(create_script, read_script, patch_script, attach_script, find_symbols); "
         f"found {validator_calls}"
     )
 
@@ -100,8 +109,8 @@ def test_filesystem_handler_uses_path_validator_at_every_entry_point() -> None:
     )
     for func_name in ("read_file", "write_file", "reimport"):
         assert f"func {func_name}" in source
-    validator_calls = source.count("McpPathValidator.validate_resource_path")
+    validator_calls = source.count("McpPathValidator.")
     assert validator_calls >= 3, (
-        f"filesystem_handler.gd should call McpPathValidator.validate_resource_path "
-        f"at least 3 times (read_file, write_file, reimport); found {validator_calls}"
+        f"filesystem_handler.gd should delegate to McpPathValidator at least 3 "
+        f"times (read_file, write_file, reimport); found {validator_calls}"
     )

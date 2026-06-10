@@ -94,3 +94,105 @@ func test_well_formed_nested_path_passes_boundary_check() -> void:
 	## that smuggles a `..` past the substring guard.
 	var safe := McpPathValidator.validate_resource_path("res://addons/godot_ai")
 	assert_eq(safe, "", "well-formed nested path must validate")
+
+
+# ----- null byte (truncation trap, audit GH-4) -----
+
+func test_rejects_embedded_null_byte() -> void:
+	## A NUL can truncate a C string, so the path written could differ from the
+	## one validated/reported. Reject any path containing one.
+	##
+	## Some Godot builds (e.g. 4.3) strip embedded nulls from String, so the
+	## payload can't be constructed there — the validator's check is simply a
+	## harmless no-op on those builds (a String that can't hold a null can't
+	## smuggle one past the guard). Skip rather than assert 4.6-only behavior.
+	var nul := String.chr(0)
+	if nul.is_empty() or not ("res://a" + nul + "b").contains(nul):
+		skip("this Godot build does not retain embedded null bytes in String")
+		return
+	# No "..": the ONLY reason to reject this path is the embedded null.
+	var err := McpPathValidator.validate_resource_path("res://safe" + nul + "name.gd")
+	assert_false(err.is_empty(), "path with an embedded null byte must be rejected")
+	assert_contains(err, "null")
+
+
+# ----- write blocklist: project-critical files (audit GH-3) -----
+#
+# These pass every structural check (res://-rooted, no traversal, under root)
+# but overwriting them corrupts the project. Blocked for writes, allowed for
+# reads (inspecting config is legitimate).
+
+func test_write_rejects_project_godot() -> void:
+	var err := McpPathValidator.validate_resource_path("res://project.godot", true)
+	assert_false(err.is_empty(), "writing res://project.godot must be rejected")
+	assert_contains(err, "project.godot")
+
+
+func test_write_rejects_godot_metadata_dir() -> void:
+	var err := McpPathValidator.validate_resource_path("res://.godot/uid_cache.bin", true)
+	assert_false(err.is_empty(), "writing under res://.godot/ must be rejected")
+	assert_contains(err, ".godot")
+
+
+func test_write_allows_import_sidecar() -> void:
+	## .import sidecars are source-controlled import config; editing them then
+	## reimporting is a legitimate, recoverable workflow, so writes are allowed.
+	assert_eq(McpPathValidator.validate_resource_path("res://icon.svg.import", true), "")
+
+
+func test_write_allows_normal_resource_path() -> void:
+	## The blocklist must not catch ordinary writes.
+	assert_eq(McpPathValidator.validate_resource_path("res://scenes/level.tscn", true), "")
+	assert_eq(McpPathValidator.validate_resource_path("res://data/config.json", true), "")
+
+
+func test_read_allows_project_critical_files() -> void:
+	## for_write defaults to false — reading project config / import data is
+	## legitimate and must not be blocked.
+	assert_eq(McpPathValidator.validate_resource_path("res://project.godot"), "")
+	assert_eq(McpPathValidator.validate_resource_path("res://.godot/uid_cache.bin"), "")
+	assert_eq(McpPathValidator.validate_resource_path("res://icon.svg.import"), "")
+
+
+func test_write_still_rejects_traversal() -> void:
+	## The structural traversal check fires regardless of for_write.
+	assert_false(McpPathValidator.validate_resource_path("res://../etc/passwd", true).is_empty())
+
+
+func test_write_rejects_override_cfg() -> void:
+	## override.cfg is applied over project.godot at startup — same takeover
+	## surface as the manifest, so writes must be refused too.
+	var err := McpPathValidator.validate_resource_path("res://override.cfg", true)
+	assert_false(err.is_empty(), "writing res://override.cfg must be rejected")
+	assert_contains(err, "override.cfg")
+
+
+func test_write_blocklist_is_case_insensitive() -> void:
+	## macOS/Windows default filesystems are case-insensitive, so a case-variant
+	## spelling resolves to the same protected file and must be refused.
+	assert_false(McpPathValidator.validate_resource_path("res://Project.godot", true).is_empty())
+	assert_false(McpPathValidator.validate_resource_path("res://.GODOT/uid_cache.bin", true).is_empty())
+
+
+func test_loadable_accepts_uid() -> void:
+	## uid:// is an opaque resource id ResourceLoader resolves to an in-project
+	## resource — it cannot express traversal, so load handlers must accept it.
+	assert_eq(McpPathValidator.validate_loadable_path("uid://b8x3k7q2vn1ya"), "")
+
+
+func test_loadable_accepts_user() -> void:
+	## user:// runtime assets were always loadable and must remain so.
+	assert_eq(McpPathValidator.validate_loadable_path("user://recording.wav.tres"), "")
+
+
+func test_loadable_rejects_user_traversal() -> void:
+	## ...but a user:// path still can't escape the user data sandbox.
+	assert_false(McpPathValidator.validate_loadable_path("user://../../etc/passwd").is_empty())
+
+
+func test_loadable_still_rejects_res_traversal() -> void:
+	assert_false(McpPathValidator.validate_loadable_path("res://../evil.gd").is_empty())
+
+
+func test_loadable_rejects_unknown_scheme() -> void:
+	assert_false(McpPathValidator.validate_loadable_path("/etc/passwd").is_empty())

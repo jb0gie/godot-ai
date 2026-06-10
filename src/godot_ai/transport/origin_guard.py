@@ -35,6 +35,14 @@ no ``-H Origin``) keep working unchanged. Browser-driven traffic — even
 ``no-cors`` subresources that wouldn't carry an Origin — is refused with
 HTTP 403 long before reaching FastMCP or our session registry.
 
+When the ``--allow-host`` opt-in (#421) binds the transport off loopback,
+the **real socket peer** (``scope["client"]`` / ``remote_address``) is the
+authoritative LAN gate — see :func:`peer_ip_allowed`. The ``Host`` header
+is client-controlled, so a peer outside the allowed range could otherwise
+pass the range check by spoofing ``Host: <an-allowed-ip>``; gating on the
+unforgeable peer address closes that. In the default loopback-only mode the
+peer gate is a pass-through and behavior is byte-for-byte unchanged.
+
 See umbrella #343, finding #1 (audit-v2).
 """
 
@@ -54,7 +62,7 @@ LOOPBACK_HOSTNAMES: frozenset[str] = frozenset({"127.0.0.1", "localhost", "[::1]
 LOOPBACK_ORIGIN_SCHEMES: frozenset[str] = frozenset({"http", "https", "ws", "wss"})
 
 FORBIDDEN_BODY = (
-    b"forbidden: non-loopback Host or Origin (DNS rebinding guard)\n"
+    b"forbidden: peer, Host, or Origin not permitted (DNS rebinding / --allow-host guard)\n"
     b"see https://github.com/hi-godot/godot-ai issue #345 for details\n"
 )
 FORBIDDEN_BODY_TEXT = FORBIDDEN_BODY.decode("utf-8")
@@ -158,6 +166,45 @@ def _host_ip_in_networks(host_header: str, networks: Sequence[IPNetwork] | None)
     return any(ip in net for net in networks)
 
 
+def peer_ip_allowed(peer_ip: str | None, allowed_networks: Sequence[IPNetwork] | None) -> bool:
+    """Whether the real TCP peer address is permitted to reach the transport.
+
+    This is the authoritative LAN gate. The ``Host`` header is
+    client-controlled — a peer outside an allowed network can spoof
+    ``Host: <an-allowed-ip>`` and pass :func:`is_allowed_host` — so when
+    the transport is bound off loopback (the ``--allow-host`` opt-in, #421)
+    the *socket peer* (``scope["client"]`` for ASGI, ``remote_address`` for
+    the WebSocket server), which the client cannot forge, must itself be
+    loopback or fall inside an allowed network.
+
+    With no allowlist (the default), the transport stays bound to loopback,
+    so the kernel already guarantees a loopback peer and this is a
+    pass-through that keeps the original behavior byte-for-byte — including
+    contexts (e.g. unit scopes) where the peer address isn't populated.
+    When an allowlist *is* set but the peer can't be determined, it fails
+    closed: better to refuse than to fall back to the spoofable header.
+    """
+    if not allowed_networks:
+        return True
+    if not peer_ip:
+        return False
+    ## Strip an IPv6 zone id (``fe80::1%eth0``) before parsing.
+    candidate = peer_ip.split("%", 1)[0].strip()
+    try:
+        ip = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    ## A dual-stack listener can report an IPv4 peer in IPv4-mapped IPv6 form
+    ## (``::ffff:127.0.0.1``), whose ``.is_loopback`` is False and which never
+    ## matches an IPv4 allowlist network. Unwrap it to the real IPv4 address so
+    ## a genuine loopback / in-network peer isn't wrongly rejected.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_loopback:
+        return True
+    return any(ip in net for net in allowed_networks)
+
+
 def is_allowed_host(
     host_header: str | None,
     allowed_networks: Sequence[IPNetwork] | None = None,
@@ -230,22 +277,30 @@ def evaluate_loopback(
     origins: list[str],
     sec_fetch_sites: list[str] | None = None,
     allowed_networks: Sequence[IPNetwork] | None = None,
+    peer_ip: str | None = None,
 ) -> bool:
-    """Return True iff the request's headers pass the allowlist.
+    """Return True iff the request passes the allowlist.
 
     Both transports (ASGI middleware + WebSocket ``process_request``)
-    funnel their per-request header extraction through this helper so
-    the duplicate-header smuggling rule, the value-allowlist rule, and
-    the Sec-Fetch-Site cross-origin reject rule are evaluated identically.
-    A divergence between the two transports would be a security
-    regression — this helper exists to prevent it.
+    funnel their per-request extraction through this helper so the
+    duplicate-header smuggling rule, the value-allowlist rule, the
+    Sec-Fetch-Site cross-origin reject rule, and the peer-address gate are
+    evaluated identically. A divergence between the two transports would be
+    a security regression — this helper exists to prevent it.
 
-    ``allowed_networks`` (the ``--allow-host`` opt-in, #421) only widens
-    the *Host* allowlist to named LAN CIDRs. The Origin and Sec-Fetch-Site
-    rules are deliberately left untouched: a browser on the LAN sends a
-    non-loopback Origin (rejected) and a foreign Sec-Fetch-Site (rejected),
-    so DNS-rebinding defense survives the opt-in. A native remote agent
-    sends neither header, so it passes once its Host IP is allowed.
+    ``allowed_networks`` (the ``--allow-host`` opt-in, #421) widens access
+    to named LAN CIDRs. Authorization is anchored on ``peer_ip`` — the real
+    socket peer, which the client cannot forge — not on the ``Host`` header
+    (which it can). The Host header is still range-checked, but only as a
+    secondary filter; the peer gate is what actually keeps out-of-range
+    hosts off the server. The Origin and Sec-Fetch-Site rules are left
+    untouched: a browser on the LAN sends a non-loopback Origin (rejected)
+    and a foreign Sec-Fetch-Site (rejected), so DNS-rebinding defense
+    survives the opt-in. A native remote agent sends neither header, so it
+    passes once both its peer address and Host IP are allowed.
+
+    When ``allowed_networks`` is None (the loopback-only default), the peer
+    gate is a pass-through and behavior is byte-for-byte unchanged.
     """
     if len(hosts) > 1 or len(origins) > 1:
         return False
@@ -255,7 +310,8 @@ def evaluate_loopback(
     origin = origins[0] if origins else None
     sec_fetch_site = sec_fetch_sites[0] if sec_fetch_sites else None
     return (
-        is_allowed_host(host, allowed_networks)
+        peer_ip_allowed(peer_ip, allowed_networks)
+        and is_allowed_host(host, allowed_networks)
         and is_allowed_origin(origin)
         and is_allowed_sec_fetch_site(sec_fetch_site)
     )
@@ -300,7 +356,13 @@ class LocalhostOnlyHTTPMiddleware:
             elif key == b"sec-fetch-site":
                 sec_fetch_sites.append(raw_value.decode("latin-1"))
 
-        if evaluate_loopback(hosts, origins, sec_fetch_sites, self.allowed_networks):
+        ## ASGI populates ``scope["client"]`` with the real ``(host, port)``
+        ## peer — unforgeable, unlike the Host header. ``None`` in unusual
+        ## servers; the peer gate fails closed for it only when opted in.
+        client = scope.get("client")
+        peer_ip = client[0] if client else None
+
+        if evaluate_loopback(hosts, origins, sec_fetch_sites, self.allowed_networks, peer_ip):
             await self.app(scope, receive, send)
             return
         await _send_forbidden(send)
@@ -323,15 +385,15 @@ async def _send_forbidden(send: Send) -> None:
 def make_websocket_request_guard(allowed_networks: Sequence[IPNetwork] | None = None):
     """Return a ``process_request`` hook for ``websockets.asyncio.server.serve``.
 
-    The hook fires before the WebSocket upgrade. When Host or Origin
-    fails the loopback allowlist the hook synthesizes an HTTP 403 via
-    ``connection.respond(...)``; returning that response from
-    ``process_request`` aborts the upgrade without ever creating a
-    Session.
+    The hook fires before the WebSocket upgrade. When the real peer
+    address, Host, or Origin fails the allowlist the hook synthesizes an
+    HTTP 403 via ``connection.respond(...)``; returning that response from
+    ``process_request`` aborts the upgrade without ever creating a Session.
 
-    ``allowed_networks`` (the ``--allow-host`` opt-in, #421) widens the
-    Host allowlist identically to the HTTP middleware so the two
-    transports never diverge.
+    ``allowed_networks`` (the ``--allow-host`` opt-in, #421) gates the
+    unforgeable peer address (``remote_address``) and widens the Host
+    allowlist identically to the HTTP middleware, so the two transports
+    never diverge.
     """
     networks = list(allowed_networks) if allowed_networks else None
 
@@ -342,7 +404,14 @@ def make_websocket_request_guard(allowed_networks: Sequence[IPNetwork] | None = 
         hosts = list(request.headers.get_all("Host"))
         origins = list(request.headers.get_all("Origin"))
         sec_fetch_sites = list(request.headers.get_all("Sec-Fetch-Site"))
-        if evaluate_loopback(hosts, origins, sec_fetch_sites, networks):
+        ## ``remote_address`` is the real TCP peer (set before the HTTP
+        ## upgrade) — unforgeable, unlike the Host header. It's a
+        ## ``(host, port[, flowinfo, scopeid])`` tuple, or None if the
+        ## socket is already gone; the peer gate fails closed for None
+        ## only when opted in.
+        remote = getattr(connection, "remote_address", None)
+        peer_ip = remote[0] if remote else None
+        if evaluate_loopback(hosts, origins, sec_fetch_sites, networks, peer_ip):
             return None
         return connection.respond(HTTPStatus.FORBIDDEN, FORBIDDEN_BODY_TEXT)
 

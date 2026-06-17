@@ -55,6 +55,8 @@ class _LeakingSuite extends McpTestSuite:
 	func suite_name() -> String: return "inner_leak"
 	func test_leaks_a_node() -> void:
 		## Attach a Node3D to the scene root and forget to clean it up.
+		if not Engine.is_editor_hint():
+			return
 		var scene_root := EditorInterface.get_edited_scene_root()
 		if scene_root == null:
 			return
@@ -62,6 +64,27 @@ class _LeakingSuite extends McpTestSuite:
 		leak.name = "__runner_leak_node__"
 		scene_root.add_child(leak)
 		assert_true(true)
+
+
+class _TrackedAllocationSuite extends McpTestSuite:
+	var tracked_object: Object
+	var tracked_node: Node
+	func suite_name() -> String: return "inner_tracked"
+	func test_tracked_allocations() -> void:
+		tracked_object = track(Object.new())
+		tracked_node = track(Node.new())
+		assert_true(is_instance_valid(tracked_object))
+		assert_true(is_instance_valid(tracked_node))
+
+
+class _ExpectedScriptErrorSuite extends McpTestSuite:
+	func suite_name() -> String: return "inner_expected_script_error"
+	func test_expected_script_error_does_not_abort() -> void:
+		expect_script_error_containing("Parse Error: Expected conditional expression after \"if\".")
+		var script := GDScript.new()
+		script.source_code = "extends Node\n\nfunc _ready() -> void:\n\tif\n"
+		var err := script.reload()
+		assert_ne(err, OK, "invalid GDScript should fail to compile")
 
 
 class _FailedSetupSuite extends McpTestSuite:
@@ -178,7 +201,7 @@ func test_failed_setup_does_not_run_other_suites_tests() -> void:
 # ----- leaked-node cleanup -----
 
 func test_leaked_nodes_are_cleaned_up_after_suite() -> void:
-	var scene_root := EditorInterface.get_edited_scene_root()
+	var scene_root := _edited_scene_root()
 	if scene_root == null:
 		skip("No scene root — is a scene open?")
 		return
@@ -192,3 +215,31 @@ func test_leaked_nodes_are_cleaned_up_after_suite() -> void:
 		"leaked node should be removed by runner")
 	assert_eq(scene_root.get_node_or_null("__runner_leak_node__"), null,
 		"leak marker should no longer exist under scene root")
+
+
+func test_tracked_allocations_are_freed_after_each_test() -> void:
+	var runner := McpTestRunner.new()
+	var suite := _TrackedAllocationSuite.new()
+
+	var result := runner.run_suites([suite])
+
+	assert_eq(result.failed, 0)
+	assert_false(is_instance_valid(suite.tracked_object), "tracked plain Object should be freed")
+	assert_false(is_instance_valid(suite.tracked_node), "tracked out-of-tree Node should be freed")
+
+
+func test_expected_script_error_does_not_fail_test() -> void:
+	if skip_on_godot_lt("4.5", "Logger subclass only exists on Godot 4.5+"):
+		return
+	var runner := McpTestRunner.new()
+	expect_script_error_containing("Parse Error: Expected conditional expression after \"if\".")
+	var result := runner.run_suites([_ExpectedScriptErrorSuite.new()])
+
+	assert_eq(result.failed, 0, "expected script errors should be filtered")
+	assert_eq(result.passed, 1)
+
+
+static func _edited_scene_root() -> Node:
+	if not Engine.is_editor_hint():
+		return null
+	return EditorInterface.get_edited_scene_root()

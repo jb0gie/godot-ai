@@ -65,6 +65,7 @@ const EVAL_PROBE_INTERVAL_SEC := 0.35
 var _log_buffer: McpLogBuffer
 var _game_log_buffer: McpGameLogBuffer
 var _editor_log_buffer: McpEditorLogBuffer
+var _surfaced_error_tracker
 
 ## Pending request_id -> {connection, timer, timeout_callable}.
 ## We retain the bound timeout lambda so `_clear_pending` can disconnect
@@ -81,16 +82,19 @@ var _game_run_token := 0
 var _ready_run_token := -1
 var _game_session_id := -1
 var _game_run_active := false
+var _manual_run_armed := false
 var _game_run_started_msec := 0
 var _game_run_started_editor_cursor := 0
+var _game_run_started_debugger_cursor := 0
 var _game_helper_expected := true
 signal game_ready
 
 
-func _init(log_buffer: McpLogBuffer = null, game_log_buffer: McpGameLogBuffer = null, editor_log_buffer: McpEditorLogBuffer = null) -> void:
+func _init(log_buffer: McpLogBuffer = null, game_log_buffer: McpGameLogBuffer = null, editor_log_buffer: McpEditorLogBuffer = null, surfaced_error_tracker = null) -> void:
 	_log_buffer = log_buffer
 	_game_log_buffer = game_log_buffer
 	_editor_log_buffer = editor_log_buffer
+	_surfaced_error_tracker = surfaced_error_tracker
 
 
 func _has_capture(prefix: String) -> bool:
@@ -107,35 +111,80 @@ func _has_capture(prefix: String) -> bool:
 ## plugin.gd's _enter_tree logs "plugin loaded", and ci-reload-test
 ## asserts "plugin loaded" is the first line after a plugin reload.
 func _setup_session(session_id: int) -> void:
-	_game_ready = false
-	_ready_run_token = -1
+	_connect_session_stopped(session_id)
+	if EditorInterface.is_playing_scene() and not _game_run_active:
+		_begin_game_run_tracking(_editor_log_cursor(), true, true, true, true, true)
+	else:
+		_game_ready = false
+		_ready_run_token = -1
 	_game_session_id = session_id
 
 
 func begin_game_run(editor_log_cursor: int = 0, helper_expected: bool = true) -> void:
+	_begin_game_run_tracking(editor_log_cursor, helper_expected, true, true)
+
+
+func _begin_game_run_tracking(
+	editor_log_cursor: int = 0,
+	helper_expected: bool = true,
+	rotate_game_log: bool = true,
+	sticky_debugger_scan: bool = true,
+	quiet: bool = false,
+	manual_armed: bool = false,
+) -> void:
 	_game_run_token += 1
 	_game_run_active = true
+	_manual_run_armed = manual_armed
 	_game_ready = false
 	_ready_run_token = -1
 	_game_session_id = -1
 	_game_run_started_msec = Time.get_ticks_msec()
 	_game_run_started_editor_cursor = maxi(0, editor_log_cursor)
+	if _surfaced_error_tracker != null:
+		_surfaced_error_tracker.note_game_run_started(sticky_debugger_scan)
+		_game_run_started_debugger_cursor = _surfaced_error_tracker.debugger_promoted_total()
+	else:
+		_game_run_started_debugger_cursor = 0
 	_game_helper_expected = helper_expected
 	var run_id := ""
-	if _game_log_buffer:
+	if _game_log_buffer and rotate_game_log:
 		run_id = _game_log_buffer.clear_for_new_run()
-	if _log_buffer:
+	if _log_buffer and not quiet:
 		var log_text := "[debug] game capture pending run token %d" % _game_run_token
 		if not run_id.is_empty():
 			log_text += " (run %s)" % run_id
 		_log_buffer.log(log_text)
 
 
+func _editor_log_cursor() -> int:
+	return _editor_log_buffer.appended_total() if _editor_log_buffer != null else 0
+
+
 func end_game_run() -> void:
 	_game_run_active = false
+	_manual_run_armed = false
 	_game_ready = false
 	_ready_run_token = -1
 	_game_session_id = -1
+	if _surfaced_error_tracker != null:
+		_surfaced_error_tracker.note_game_run_stopped()
+
+
+func _connect_session_stopped(session_id: int) -> void:
+	var session = get_session(session_id)
+	if session == null:
+		return
+	var stopped := Callable(self, "_on_debugger_session_stopped").bind(session_id)
+	if not session.stopped.is_connected(stopped):
+		session.stopped.connect(stopped)
+
+
+func _on_debugger_session_stopped(session_id: int) -> void:
+	if not _manual_run_armed:
+		return
+	if _game_session_id != -1 and session_id != _game_session_id:
+		return
+	end_game_run()
 
 
 func is_game_capture_ready() -> bool:
@@ -224,6 +273,32 @@ func recent_editor_errors_since(cursor: int) -> Dictionary:
 func _recent_editor_errors_since(cursor: int) -> Dictionary:
 	var out: Array[Dictionary] = []
 	var truncated := false
+	if _surfaced_error_tracker != null:
+		var captured_by_tracker: Dictionary = _surfaced_error_tracker.editor_entries_since(
+			maxi(0, cursor),
+			_game_run_started_debugger_cursor,
+			false,
+		)
+		truncated = bool(captured_by_tracker.get("truncated", false))
+		for raw_entry in captured_by_tracker.get("entries", []):
+			var compact := _compact_editor_error(raw_entry)
+			if compact.is_empty():
+				continue
+			out.append(compact)
+			if out.size() >= 5:
+				break
+		if not out.is_empty():
+			return {"errors": out, "truncated": truncated, "scope": "run"}
+		for raw_entry in _surfaced_error_tracker.retained_recent_editor_entries():
+			var compact := _compact_editor_error(raw_entry, true)
+			if compact.is_empty():
+				continue
+			out.append(compact)
+			if out.size() >= 5:
+				break
+		if not out.is_empty():
+			return {"errors": out, "truncated": false, "scope": "retained_recent"}
+		return {"errors": out, "truncated": false, "scope": "none"}
 	if _editor_log_buffer == null:
 		return {"errors": out, "truncated": false, "scope": "none"}
 	var captured: Dictionary = _editor_log_buffer.get_since(maxi(0, cursor), -1)

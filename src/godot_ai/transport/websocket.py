@@ -225,6 +225,8 @@ class GodotWebSocketServer:
                 ## existing event-driven path still applies.
                 if response.readiness is not None and live is not None:
                     sync_readiness_for_session(live, response.readiness)
+                if response.error_watermark is not None and live is not None:
+                    _sync_error_watermark_for_session(live, response.error_watermark)
                 future = self._pending.pop(response.request_id, None)
                 if future and not future.done():
                     future.set_result(response)
@@ -320,3 +322,53 @@ class GodotWebSocketServer:
             )
         finally:
             self._pending.pop(request.request_id, None)
+
+
+def _sync_error_watermark_for_session(session: Session, value: dict[str, int]) -> int:
+    """Update a session's error watermark and return newly observed errors.
+
+    Watermark components reset independently. When run_seq advances, the
+    per-run game component is counted in full because the server may never
+    observe its zero between stop/start. Editor and debugger components remain
+    session-scoped monotonic deltas; a decrease is treated as a reset and the
+    current component value is counted when above zero.
+    """
+
+    updates: dict[str, int] = {}
+    new_total = 0
+    incoming_run_seq = _normalized_watermark_int(value.get("run_seq"))
+    previous_run_seq = max(0, int(session.error_watermark.get("run_seq", 0)))
+    run_advanced = (
+        incoming_run_seq is not None
+        and previous_run_seq > 0
+        and incoming_run_seq > previous_run_seq
+    )
+    for key, raw_current in value.items():
+        current = _normalized_watermark_int(raw_current)
+        if current is None:
+            continue
+        updates[key] = current
+        if key == "run_seq":
+            continue
+
+        previous = session.error_watermark.get(key)
+        if previous is not None:
+            previous_int = max(0, int(previous))
+            if run_advanced and key == "game_error_warn":
+                new_total += current
+            elif current >= previous_int:
+                new_total += current - previous_int
+            else:
+                new_total += current
+        elif run_advanced and key == "game_error_warn":
+            new_total += current
+    session.error_watermark.update(updates)
+    session.pending_new_errors += new_total
+    return new_total
+
+
+def _normalized_watermark_int(value: object) -> int | None:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None

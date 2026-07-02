@@ -31,6 +31,8 @@ class Session:
     current_scene: str = ""
     play_state: str = "stopped"
     readiness: str = "ready"
+    error_watermark: dict[str, int] = field(default_factory=dict)
+    pending_new_errors: int = 0
     editor_pid: int = 0
     ## Which launcher tier the plugin resolved the Python server from —
     ## "dev_venv" | "uvx" | "system" | "unknown". Lets agents notice when a

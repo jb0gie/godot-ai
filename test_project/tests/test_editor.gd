@@ -780,6 +780,23 @@ func test_game_log_buffer_unknown_level_coerces_to_info() -> void:
 	assert_eq(entries[0].level, "info", "Unknown level should coerce to info")
 
 
+func test_game_log_buffer_error_warn_total_ignores_info_and_resets_per_run() -> void:
+	var buf := McpGameLogBuffer.new()
+	buf.append("info", "ready")
+	buf.append("warn", "careful")
+	buf.append("error", "boom")
+	assert_eq(buf.error_warn_total(), 2)
+	assert_eq(buf.error_total(), 1)
+	buf.clear_for_new_run()
+	assert_eq(buf.error_warn_total(), 0, "new game runs start a fresh error watermark")
+	assert_eq(buf.error_total(), 0, "new game runs start a fresh error-only watermark")
+	buf.append("info", "chatty print")
+	buf.append("warn", "new run warning")
+	buf.append("error", "new run boom")
+	assert_eq(buf.error_warn_total(), 2)
+	assert_eq(buf.error_total(), 1)
+
+
 func test_game_log_buffer_preserves_details() -> void:
 	var buf := McpGameLogBuffer.new()
 	buf.append("error", "boom", {
@@ -1133,6 +1150,8 @@ func test_editor_log_buffer_append_and_get_range() -> void:
 	assert_eq(entries[1].level, "warn")
 	assert_eq(entries[1].function, "_ready")
 	assert_eq(buf.total_count(), 2)
+	assert_eq(buf.appended_total(), 2)
+	assert_eq(buf.error_appended_total(), 1)
 
 
 func test_editor_log_buffer_unknown_level_coerces_to_info() -> void:
@@ -1252,6 +1271,7 @@ func test_editor_log_buffer_clear_resets_retained_counts_but_preserves_cursor() 
 	assert_eq(buf.total_count(), 0)
 	assert_eq(buf.dropped_count(), 0)
 	assert_eq(buf.appended_total(), cursor, "clear() must not reset the cursor")
+	assert_eq(buf.error_appended_total(), 0, "clear() resets the retained error watermark")
 
 
 func test_editor_log_buffer_get_since_reports_clear_truncation() -> void:
@@ -1396,6 +1416,99 @@ func test_get_logs_source_editor_reads_debugger_errors_tree() -> void:
 	assert_eq(result.data.lines[0].function, "GDScript::reload")
 	assert_eq(result.data.lines[1].level, "error")
 	assert_eq(result.data.lines[1].path, "res://scripts/broken.gd")
+
+
+func test_surfaced_error_tracker_promotes_debugger_rows_into_watermark() -> void:
+	var tree := _make_debugger_errors_tree()
+	var tracker := McpSurfacedErrorTracker.new(null, null, tree)
+	var cached := tracker.watermark()
+	assert_eq(cached.debugger_promoted, 0, "Inactive dispatch watermarks must be cheap cached reads")
+	var watermark := tracker.watermark(true)
+	assert_eq(watermark.editor_ring, 0)
+	assert_eq(watermark.debugger_promoted, 1)
+	assert_eq(watermark.game_error_warn, 0)
+	var second := tracker.watermark(true)
+	assert_eq(second.debugger_promoted, 1, "same visible rows must not double-count")
+	tree.free()
+
+
+func test_surfaced_error_tracker_editor_entries_since_includes_debugger_only_rows() -> void:
+	var tree := _make_debugger_errors_tree()
+	var tracker := McpSurfacedErrorTracker.new(null, null, tree)
+	var baseline := 0
+	var captured := tracker.editor_entries_since(0, baseline)
+	assert_eq(captured.entries.size(), 1)
+	assert_eq(captured.entries[0].text, "Parse Error: Expected statement")
+	baseline = tracker.debugger_promoted_total()
+	var after_baseline := tracker.editor_entries_since(0, baseline)
+	assert_eq(after_baseline.entries.size(), 0)
+	tree.free()
+
+
+func test_surfaced_error_tracker_run_start_repromotes_recurring_debugger_error() -> void:
+	var tree := _make_debugger_errors_tree()
+	var tracker := McpSurfacedErrorTracker.new(null, null, tree)
+	var first := tracker.watermark(true)
+	assert_eq(first.run_seq, 0)
+	assert_eq(first.debugger_promoted, 1)
+	tracker.note_game_run_started(false)
+	assert_eq(McpSurfacedErrorTracker.entries_from_debugger_error_tree(tree).size(), 2)
+	var unchanged := tracker.watermark(true)
+	assert_eq(unchanged.run_seq, 1)
+	assert_eq(unchanged.debugger_promoted, 1, "unchanged visible rows must not re-promote across a run boundary")
+	_append_duplicate_parse_error(tree.get_root())
+	var second := tracker.watermark(true)
+	assert_eq(second.run_seq, 1)
+	assert_eq(second.debugger_promoted, 2, "a new identical row should promote as a recurrence")
+	tree.free()
+
+
+func test_surfaced_error_tracker_user_clear_then_recurrence_promotes() -> void:
+	var tree := _make_debugger_errors_tree()
+	var tracker := McpSurfacedErrorTracker.new(null, null, tree)
+	assert_eq(tracker.watermark(true).debugger_promoted, 1)
+	tree.clear()
+	tracker.watermark(true)
+	var root := tree.create_item()
+	_append_duplicate_parse_error(root)
+	assert_eq(tracker.watermark(true).debugger_promoted, 2)
+	tree.free()
+
+
+func test_surfaced_error_tracker_watermark_ignores_warnings() -> void:
+	var editor_buf := McpEditorLogBuffer.new()
+	editor_buf.append("warn", "save warning", "res://warn.gd", 2)
+	editor_buf.append("error", "parse error", "res://broken.gd", 4)
+	var game_buf := McpGameLogBuffer.new()
+	game_buf.clear_for_new_run()
+	game_buf.append("warn", "runtime warning")
+	game_buf.append("error", "runtime error")
+	var tree := _make_debugger_errors_tree()
+	var tracker := McpSurfacedErrorTracker.new(editor_buf, game_buf, tree)
+	var watermark := tracker.watermark(true)
+	assert_eq(watermark.editor_ring, 1)
+	assert_eq(watermark.game_error_warn, 1)
+	assert_eq(watermark.debugger_promoted, 1)
+	tree.free()
+
+
+func test_surfaced_error_tracker_caps_promoted_debugger_entries() -> void:
+	var tree := _make_debugger_errors_tree()
+	var root := tree.get_root()
+	for i in range(McpSurfacedErrorTracker.MAX_PROMOTED_DEBUGGER_ENTRIES + 5):
+		_append_debugger_error(root, i)
+	var tracker := McpSurfacedErrorTracker.new(null, null, tree)
+	assert_eq(tracker.watermark(true).debugger_promoted, McpSurfacedErrorTracker.MAX_PROMOTED_DEBUGGER_ENTRIES + 6)
+	var captured := tracker.editor_entries_since(0, 0)
+	assert_true(captured.truncated, "Trimmed debugger entries should be reported as truncated")
+	assert_eq(captured.entries.size(), McpSurfacedErrorTracker.MAX_PROMOTED_DEBUGGER_ENTRIES)
+	assert_eq(captured.entries[0].text, "Synthetic Error 5")
+	assert_eq(
+		tracker.watermark(true).debugger_promoted,
+		McpSurfacedErrorTracker.MAX_PROMOTED_DEBUGGER_ENTRIES + 6,
+		"Trimmed but still-visible debugger rows must not be promoted again",
+	)
+	tree.free()
 
 
 func test_get_logs_source_editor_details_include_debugger_errors_children() -> void:
@@ -1615,6 +1728,22 @@ func _make_debugger_errors_tree() -> Tree:
 	error.set_text(1, "Parse Error: Expected statement")
 	error.set_metadata(0, ["res://scripts/broken.gd", 12])
 	return tree
+
+
+func _append_debugger_error(root: TreeItem, index: int) -> void:
+	var error := root.get_tree().create_item(root)
+	error.set_meta("_is_error", true)
+	error.set_text(0, "0:00:01:%03d" % index)
+	error.set_text(1, "Synthetic Error %d" % index)
+	error.set_metadata(0, ["res://scripts/generated_%d.gd" % index, index + 1])
+
+
+func _append_duplicate_parse_error(root: TreeItem) -> void:
+	var error := root.get_tree().create_item(root)
+	error.set_meta("_is_error", true)
+	error.set_text(0, "0:00:01:000")
+	error.set_text(1, "Parse Error: Expected statement")
+	error.set_metadata(0, ["res://scripts/broken.gd", 12])
 
 
 func test_log_backtrace_resolve_error_preserves_all_frames() -> void:
@@ -2119,6 +2248,31 @@ func test_debugger_plugin_ignores_hello_from_stale_session() -> void:
 	plugin._capture("mcp:hello", [], 22)
 	assert_true(plugin.is_game_capture_ready(), "hello from current session should ready capture")
 	assert_eq(game_buf.run_id(), run_id, "current hello confirms the existing run identity")
+
+
+func test_debugger_plugin_manual_run_stop_rearms_next_session() -> void:
+	var log_buf := McpLogBuffer.new()
+	var tracker := McpSurfacedErrorTracker.new()
+	var plugin := McpDebuggerPlugin.new(log_buf, McpGameLogBuffer.new(), McpEditorLogBuffer.new(), tracker)
+	plugin._begin_game_run_tracking(10, true, true, true, true, true)
+	plugin._game_session_id = 11
+	assert_eq(plugin.get_game_status().active, true)
+	assert_eq(plugin.get_game_status().run_token, 1)
+	assert_eq(log_buf.total_count(), 0, "manual _setup_session arming must stay quiet for reload tests")
+	assert_eq(tracker._debugger_scan_active, true, "manual runs should use sticky scanning until stopped")
+
+	plugin._on_debugger_session_stopped(12)
+	assert_eq(plugin.get_game_status().active, true, "stale session stop must not end the active run")
+	plugin._on_debugger_session_stopped(11)
+	assert_eq(plugin.get_game_status().status, "stopped")
+	assert_eq(tracker._debugger_scan_active, false)
+
+	plugin._begin_game_run_tracking(20, true, true, true, true, true)
+	plugin._game_session_id = 22
+	assert_eq(plugin.get_game_status().active, true)
+	assert_eq(plugin.get_game_status().run_token, 2)
+	assert_eq(plugin.get_game_status().editor_log_cursor, 20)
+	assert_eq(tracker._debugger_scan_active, true)
 
 
 func test_debugger_plugin_log_batch_no_buffer_is_safe() -> void:

@@ -6657,6 +6657,97 @@ class TestManageRollupAcceptsStringifiedParams:
         assert result.data["path"] == "res://demo.tscn"
 
 
+class TestTilemapAndTilesetManageRollups:
+    async def test_tilemap_manage_set_cell_dispatches_plugin_command(self, mcp_stack):
+        client, plugin = mcp_stack
+
+        async def respond():
+            cmd = await plugin.recv_command()
+            assert cmd["command"] == "tilemap_set_cell"
+            assert cmd["params"] == {
+                "path": "/Main/Ground",
+                "source_id": 2,
+                "atlas_col": 1,
+                "atlas_row": 3,
+                "map_x": 8,
+                "map_y": 9,
+            }
+            await plugin.send_response(
+                cmd["request_id"],
+                {
+                    "path": "/Main/Ground",
+                    "map_x": 8,
+                    "map_y": 9,
+                    "source_id": 2,
+                    "atlas_col": 1,
+                    "atlas_row": 3,
+                    "undoable": True,
+                },
+            )
+
+        task = asyncio.create_task(respond())
+        result = await client.call_tool(
+            "tilemap_manage",
+            {
+                "op": "tilemap_set_cell",
+                "params": {
+                    "path": "/Main/Ground",
+                    "source_id": 2,
+                    "atlas_col": 1,
+                    "atlas_row": 3,
+                    "map_x": 8,
+                    "map_y": 9,
+                },
+            },
+        )
+        await task
+
+        assert result.data["map_x"] == 8
+        assert result.data["map_y"] == 9
+        assert result.data["undoable"] is True
+
+    async def test_tileset_manage_get_atlas_image_dispatches_plugin_command(self, mcp_stack):
+        client, plugin = mcp_stack
+
+        async def respond():
+            cmd = await plugin.recv_command()
+            assert cmd["command"] == "tileset_get_atlas_image"
+            assert cmd["params"] == {
+                "tileset_path": "res://tilesets/atlas.tres",
+                "source_id": 7,
+                "max_size": 128,
+            }
+            await plugin.send_response(
+                cmd["request_id"],
+                {
+                    "image_base64": "aGVsbG8=",
+                    "width": 128,
+                    "height": 64,
+                    "original_width": 512,
+                    "original_height": 256,
+                    "format": "png",
+                },
+            )
+
+        task = asyncio.create_task(respond())
+        result = await client.call_tool(
+            "tileset_manage",
+            {
+                "op": "tileset_get_atlas_image",
+                "params": {
+                    "tileset_path": "res://tilesets/atlas.tres",
+                    "source_id": 7,
+                    "max_size": 128,
+                },
+            },
+        )
+        await task
+
+        assert result.data["format"] == "png"
+        assert result.data["width"] == 128
+        assert result.data["original_width"] == 512
+
+
 # ---------------------------------------------------------------------------
 # *_manage op typo "Did you mean" hint (#211)
 # ---------------------------------------------------------------------------

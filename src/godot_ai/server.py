@@ -65,6 +65,8 @@ from godot_ai.tools.session import register_session_tools
 from godot_ai.tools.signal import register_signal_tools
 from godot_ai.tools.testing import register_testing_tools
 from godot_ai.tools.theme import register_theme_tools
+from godot_ai.tools.tilemap import register_tilemap_tools
+from godot_ai.tools.tileset import register_tileset_tools
 from godot_ai.tools.ui import register_ui_tools
 from godot_ai.transport.origin_guard import IPNetwork, LocalhostOnlyHTTPMiddleware
 from godot_ai.transport.websocket import GodotWebSocketServer
@@ -246,6 +248,9 @@ def create_server(
             "                   noise_texture_create\n"
             "  api_manage       get_class\n"
             "  client_manage    status, configure, remove\n\n"
+            "  tilemap_manage   tilemap_set_cell, tilemap_set_cells_rect,\n"
+            "                   tilemap_clear, tilemap_get_cells\n"
+            "  tileset_manage   tileset_get_atlas_tiles, tileset_get_atlas_image\n\n"
             "Resources (read-only URIs, no tool-count cost — prefer for active-session "
             "reads when the client surfaces them):\n"
             "  godot://sessions, godot://editor/state, godot://selection/current,\n"
@@ -386,6 +391,10 @@ def create_server(
         register_camera_tools(mcp)
     if "audio" not in exclude:
         register_audio_tools(mcp)
+    if "tilemap" not in exclude:
+        register_tilemap_tools(mcp)
+    if "tileset" not in exclude:
+        register_tileset_tools(mcp)
 
     register_session_resources(mcp)
     register_scene_resources(mcp)

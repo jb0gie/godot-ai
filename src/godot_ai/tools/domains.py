@@ -49,6 +49,8 @@ DOMAINS: tuple[str, ...] = (
     "particle",
     "camera",
     "audio",
+    "tilemap",
+    "tileset",
 )
 
 ## Domains that contain at least one core (always-loaded) tool. When the

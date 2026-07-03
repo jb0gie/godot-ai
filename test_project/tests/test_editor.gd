@@ -214,6 +214,7 @@ func test_clear_logs_routes_through_debugger_clear_button() -> void:
 func test_screenshot_invalid_source() -> void:
 	var result := _handler.take_screenshot({"source": "invalid"})
 	assert_is_error(result, ErrorCodes.VALUE_OUT_OF_RANGE)
+	assert_contains(result.error.message, "viewport_2d")
 
 
 func test_screenshot_game_not_playing() -> void:
@@ -264,7 +265,9 @@ func test_viewport_precheck_rejects_node2d_root() -> void:
 	## scene_get_hierarchy so the LLM can actually act on it.
 	assert_contains(result.error.message, "Node2D")
 	assert_contains(result.error.message, "cinematic")
+	assert_contains(result.error.message, "viewport_2d")
 	assert_contains(result.error.message, "scene_get_hierarchy")
+	assert_eq(result.error.data.suggestion, "use source='viewport_2d' for 2D scenes")
 
 
 func test_viewport_precheck_rejects_control_root() -> void:

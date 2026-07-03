@@ -416,8 +416,30 @@ func take_screenshot(params: Dictionary) -> Dictionary:
 			return McpDispatcher.DEFERRED_RESPONSE
 		"cinematic":
 			return _take_cinematic_screenshot(max_resolution)
+		"viewport_2d":
+			viewport = EditorInterface.get_editor_viewport_2d()
+			if viewport == null:
+				return ErrorCodes.make(ErrorCodes.EDITOR_NOT_READY, "No 2D viewport available")
+			var scene_root_2d := EditorInterface.get_edited_scene_root()
+			if scene_root_2d == null:
+				return ErrorCodes.make(ErrorCodes.EDITOR_NOT_READY,
+					"No scene open — open a scene first")
+			if not view_target.is_empty() or coverage or custom_elevation != null or custom_azimuth != null or custom_fov != null:
+				return ErrorCodes.make(
+					ErrorCodes.INVALID_PARAMS,
+					"view_target, coverage, elevation, azimuth, and fov are not supported with source='viewport_2d'"
+				)
+			## Capture the 2D editor viewport directly; no view_target/coverage for 2D.
+			RenderingServer.force_draw(false)
+			var image_2d: Image = viewport.get_texture().get_image()
+			if image_2d == null or image_2d.is_empty():
+				return _empty_image_error(
+					"viewport_2d",
+					"Captured an empty image from the 2D viewport. The 2D viewport produced no output — typically headless mode or the 2D viewport has not drawn a frame yet."
+				)
+			return _finalize_image(image_2d, "viewport_2d", max_resolution)
 		_:
-			return ErrorCodes.make(ErrorCodes.VALUE_OUT_OF_RANGE, "Invalid source '%s' — use 'viewport', 'cinematic', or 'game'" % source)
+			return ErrorCodes.make(ErrorCodes.VALUE_OUT_OF_RANGE, "Invalid source '%s' — use 'viewport', 'viewport_2d', 'cinematic', or 'game'" % source)
 
 	## Handle view_target: temporarily reposition the editor's own camera to
 	## frame one or more target nodes, force a render, capture, then restore.
@@ -670,12 +692,14 @@ static func viewport_screenshot_precheck(scene_root: Node) -> Dictionary:
 		return {}
 	var root_type := scene_root.get_class()
 	var hint: String
-	if scene_root is Node2D or scene_root is Control:
+	var is_2d_scene := scene_root is CanvasItem
+	if is_2d_scene:
 		hint = (
 			"The 3D viewport is empty because the current scene is 2D (%s root) with no Node3D descendants. "
 			+ "Options: (a) open a 3D scene, "
 			+ "(b) use source=\"cinematic\" if a Camera3D exists in the scene, "
-			+ "(c) call scene_get_hierarchy first to inspect what's available."
+			+ "(c) use source=\"viewport_2d\" to capture the 2D editor viewport directly, "
+			+ "(d) call scene_get_hierarchy first to inspect what's available."
 		) % root_type
 	else:
 		hint = (
@@ -684,7 +708,10 @@ static func viewport_screenshot_precheck(scene_root: Node) -> Dictionary:
 			+ "(b) use source=\"cinematic\" if a Camera3D exists in the scene, "
 			+ "(c) call scene_get_hierarchy first to inspect what's available."
 		) % root_type
-	return _make_viewport_not_3d_error(root_type, hint)
+	var err := _make_viewport_not_3d_error(root_type, hint)
+	if is_2d_scene:
+		err["error"]["data"]["suggestion"] = "use source='viewport_2d' for 2D scenes"
+	return err
 
 
 ## True if scene_root is itself a Node3D or owns any Node3D descendant.

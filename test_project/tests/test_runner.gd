@@ -1,6 +1,8 @@
 @tool
 extends McpTestSuite
 
+const TestHandler := preload("res://addons/godot_ai/handlers/test_handler.gd")
+
 ## Tests for McpTestRunner itself — specifically the guardrails that
 ## catch silent failures: skip() mechanism, zero-assertion detection,
 ## deep ctx isolation, and leaked-node cleanup.
@@ -237,6 +239,56 @@ func test_expected_script_error_does_not_fail_test() -> void:
 
 	assert_eq(result.failed, 0, "expected script errors should be filtered")
 	assert_eq(result.passed, 1)
+
+
+func test_run_tests_annotates_edited_scene() -> void:
+	## #635: run_tests surfaces the edited scene so main-scene-assuming suites'
+	## phantom failures are attributable. Verify the annotation is populated.
+	var handler := TestHandler.new(null, null)
+	var results := {"failed": 0}
+	handler._annotate_edited_scene(results)
+	assert_has_key(results, "edited_scene")
+	var scene_root := EditorInterface.get_edited_scene_root()
+	var expected := scene_root.scene_file_path if scene_root else ""
+	assert_eq(results.edited_scene, expected)
+	## Tests run with the main scene open, so no warning should be emitted even
+	## though failed=0 here.
+	assert_false(results.has("scene_warning"),
+		"no warning when edited scene is the main scene")
+
+
+func test_annotate_scene_warns_on_mismatch_with_failures() -> void:
+	## #635: deterministically exercise BOTH the warn and no-warn branches by
+	## overriding application/run/main_scene to a path that cannot equal the
+	## edited scene, then restoring it. (Reading the live main_scene and
+	## branching the assertion on it — as an earlier draft did — is tautological:
+	## in CI the main scene is open, so only the suppression branch ever ran.)
+	var handler := TestHandler.new(null, null)
+	var key := "application/run/main_scene"
+	var had_setting := ProjectSettings.has_setting(key)
+	var original = ProjectSettings.get_setting(key) if had_setting else null
+	var fake_main := "res://__mcp_nonexistent_main__.tscn"
+
+	# mismatch + failures => warning naming the mismatched main scene
+	ProjectSettings.set_setting(key, fake_main)
+	var failing := {"failed": 3}
+	handler._annotate_edited_scene(failing)
+	# mismatch + zero failures => no warning
+	var clean := {"failed": 0}
+	handler._annotate_edited_scene(clean)
+
+	# restore BEFORE asserting so a failed assert can't leak the override
+	if had_setting:
+		ProjectSettings.set_setting(key, original)
+	else:
+		ProjectSettings.clear(key)
+
+	assert_true(failing.has("scene_warning"),
+		"edited scene != main_scene with failures must warn")
+	assert_true(str(failing.get("scene_warning", "")).contains(fake_main),
+		"warning should name the mismatched main scene")
+	assert_false(clean.has("scene_warning"),
+		"mismatch but zero failures must not warn")
 
 
 static func _edited_scene_root() -> Node:

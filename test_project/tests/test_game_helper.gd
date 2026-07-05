@@ -169,3 +169,78 @@ func test_get_ui_elements_can_filter_disabled_and_include_hidden() -> void:
 	assert_true(names.has("NameInput"), "enabled control should be included")
 	assert_true(names.has("HiddenButIncluded"), "hidden control should be included when requested")
 	assert_false(names.has("DisabledButton"), "disabled control should be filtered when requested")
+
+
+# ----- input_mouse position resolution (#635) -----
+
+func test_input_mouse_position_dict() -> void:
+	var r: Dictionary = _helper.call("_resolve_mouse_position", {"x": 12.0, "y": 34.0})
+	assert_false(r.has("error"), "valid dict must not error")
+	assert_eq(r.position, Vector2(12, 34))
+
+
+func test_input_mouse_position_array_coerces() -> void:
+	## Arrays [x, y] are accepted as a coercion, matching the dict-or-array
+	## flexibility elsewhere in the tool surface.
+	var r: Dictionary = _helper.call("_resolve_mouse_position", [56.0, 78.0])
+	assert_false(r.has("error"), "2-element array must not error")
+	assert_eq(r.position, Vector2(56, 78))
+
+
+func test_input_mouse_position_absent_falls_back() -> void:
+	## Omitting position (null) is a deliberate default: use the live cursor.
+	var r: Dictionary = _helper.call("_resolve_mouse_position", null)
+	assert_false(r.has("error"), "absent position must fall back, not error")
+	assert_true(r.has("position"))
+
+
+func test_input_mouse_position_malformed_array_rejected() -> void:
+	var r: Dictionary = _helper.call("_resolve_mouse_position", [1.0, 2.0, 3.0])
+	assert_true(r.has("error"), "3-element array must be rejected, not silently substituted")
+	## A rejection must NOT also hand back a fallback position — otherwise a
+	## regression could silently substitute cursor coords despite the error.
+	assert_false(r.has("position"), "rejected input must not carry a fallback position")
+
+
+func test_input_mouse_position_wrong_type_rejected() -> void:
+	## #635: a present but wrong-shaped position (here a bare number) must be
+	## rejected instead of silently falling back to the cursor, which hid
+	## caller bugs.
+	var r: Dictionary = _helper.call("_resolve_mouse_position", 42.0)
+	assert_true(r.has("error"), "scalar position must be rejected")
+	assert_false(r.has("position"), "rejected input must not carry a fallback position")
+
+
+func test_input_mouse_position_empty_dict_falls_back() -> void:
+	## An empty {} is treated as "unspecified" (like absent) and falls back.
+	var r: Dictionary = _helper.call("_resolve_mouse_position", {})
+	assert_false(r.has("error"), "empty dict must fall back, not error")
+	assert_true(r.has("position"))
+
+
+func test_input_mouse_position_dict_without_xy_rejected() -> void:
+	## Copilot review: a NON-empty dict carrying neither coordinate (e.g.
+	## {"foo": 1}) is a caller mistake, not a request for the default — reject
+	## it instead of silently substituting the cursor.
+	var r: Dictionary = _helper.call("_resolve_mouse_position", {"foo": 1})
+	assert_true(r.has("error"), "non-empty dict without x/y must be rejected")
+	assert_false(r.has("position"))
+
+
+func test_input_mouse_position_non_numeric_rejected() -> void:
+	## Copilot review: non-numeric coordinates must be rejected rather than
+	## coerced through float() (which would silently produce 0.0).
+	var r_dict: Dictionary = _helper.call("_resolve_mouse_position", {"x": "left", "y": 5})
+	assert_true(r_dict.has("error"), "non-numeric dict x must be rejected")
+	assert_false(r_dict.has("position"))
+	var r_arr: Dictionary = _helper.call("_resolve_mouse_position", ["a", "b"])
+	assert_true(r_arr.has("error"), "non-numeric array elements must be rejected")
+	assert_false(r_arr.has("position"))
+
+
+func test_input_mouse_position_partial_dict_uses_number() -> void:
+	## A partial dict with one numeric coordinate is still valid — the missing
+	## axis defaults to the current cursor. (x present and numeric here.)
+	var r: Dictionary = _helper.call("_resolve_mouse_position", {"x": 7})
+	assert_false(r.has("error"), "partial numeric dict must not error")
+	assert_eq(r.position.x, 7.0)

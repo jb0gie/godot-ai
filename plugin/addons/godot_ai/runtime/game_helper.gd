@@ -479,7 +479,10 @@ func _game_input_key(params: Dictionary) -> Dictionary:
 
 func _game_input_mouse(params: Dictionary) -> Dictionary:
 	var event := str(params.get("event", "button"))
-	var pos := _dict_to_vector2(params.get("position", {}))
+	var pos_result := _resolve_mouse_position(params.get("position"))
+	if pos_result.has("error"):
+		return {"sent": false, "event": event, "error": pos_result.error}
+	var pos: Vector2 = pos_result.position
 	match event:
 		"motion":
 			var motion := InputEventMouseMotion.new()
@@ -557,14 +560,41 @@ func _game_input_state(params: Dictionary) -> Dictionary:
 	return {"actions": states}
 
 
-func _dict_to_vector2(value: Variant) -> Vector2:
+## Resolve a mouse-position param. Absent (null, or an empty {}) falls back to
+## the live cursor position — a deliberate default. A present but wrong-shaped
+## value is rejected instead of silently substituting the cursor, which
+## previously hid caller bugs (#635). Accepts a {x, y} dict or an [x, y] array;
+## returns {position: Vector2} or {error: String}.
+func _resolve_mouse_position(value: Variant) -> Dictionary:
 	var viewport := get_viewport()
 	var fallback := viewport.get_mouse_position() if viewport != null else Vector2.ZERO
+	if value == null:
+		return {"position": fallback}
 	if value is Dictionary:
-		if value.is_empty() or (not value.has("x") and not value.has("y")):
-			return fallback
-		return Vector2(float(value.get("x", fallback.x)), float(value.get("y", fallback.y)))
-	return fallback
+		var dict: Dictionary = value
+		if dict.is_empty():
+			return {"position": fallback}
+		# A non-empty dict that carries neither coordinate is a caller mistake,
+		# not "use the default" — reject rather than silently substitute.
+		if not dict.has("x") and not dict.has("y"):
+			return {"error": "position object must have an 'x' and/or 'y' key (got keys %s)" % str(dict.keys())}
+		var x_val: Variant = dict.get("x", fallback.x)
+		var y_val: Variant = dict.get("y", fallback.y)
+		if not _is_number(x_val) or not _is_number(y_val):
+			return {"error": "position x/y must be numbers (got x=%s, y=%s)" % [type_string(typeof(x_val)), type_string(typeof(y_val))]}
+		return {"position": Vector2(float(x_val), float(y_val))}
+	if value is Array:
+		var arr: Array = value
+		if arr.size() != 2:
+			return {"error": "position array must be [x, y] (got %d elements)" % arr.size()}
+		if not _is_number(arr[0]) or not _is_number(arr[1]):
+			return {"error": "position array elements must be numbers (got [%s, %s])" % [type_string(typeof(arr[0])), type_string(typeof(arr[1]))]}
+		return {"position": Vector2(float(arr[0]), float(arr[1]))}
+	return {"error": "position must be a {x, y} object or [x, y] array (got %s)" % type_string(typeof(value))}
+
+
+func _is_number(v: Variant) -> bool:
+	return typeof(v) == TYPE_INT or typeof(v) == TYPE_FLOAT
 
 
 func _mouse_button_index(name: String) -> int:

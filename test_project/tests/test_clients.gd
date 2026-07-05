@@ -50,7 +50,7 @@ func test_registry_loads_all_clients() -> void:
 	var ids := McpClientRegistry.ids()
 	assert_gt(ids.size(), 10, "Expected at least 10 registered clients, got %d" % ids.size())
 	# Each existing client must remain registered for behaviour parity.
-	for required in ["claude_code", "claude_desktop", "codex", "antigravity"]:
+	for required in ["claude_code", "claude_desktop", "codex", "antigravity", "hermes"]:
 		assert_true(McpClientRegistry.has_id(required), "Missing client: %s" % required)
 
 
@@ -1926,6 +1926,82 @@ func test_build_entry_force_overwrites_drifted_required_fields() -> void:
 	var rebuilt := McpJsonStrategy.build_entry(c, "http://new/mcp", legacy_sse)
 	assert_eq(rebuilt.get("type"), "streamable-http", "type pin must overwrite legacy SSE")
 	assert_eq(rebuilt.get("alwaysAllow"), ["session_manage"], "user state still preserved across the type fix")
+
+
+# ----- hermes -----
+
+func test_hermes_is_registered() -> void:
+	var c := McpClientRegistry.get_by_id("hermes")
+	assert_true(c != null, "hermes client must be registered")
+	assert_eq(c.display_name, "Hermes")
+	assert_eq(c.config_type, "json")
+
+
+func test_hermes_entry_pins_streamable_http_transport() -> void:
+	## Hermes Agent expects a streamable-http transport. The entry must pin
+	## the type so the out-of-the-box config negotiates correctly.
+	var c := McpClientRegistry.get_by_id("hermes")
+	var entry := McpJsonStrategy.build_entry(c, "http://x")
+	assert_eq(entry.get("type", ""), "streamable-http")
+	assert_eq(entry.get("url", ""), "http://x")
+	var manual := McpManualCommand.build(c, "godot-ai", "http://x", "/tmp/hermes.json")
+	assert_contains(manual, "\"type\": \"streamable-http\"")
+
+
+func test_hermes_entry_verifies_as_match() -> void:
+	## The standard entry shape must round-trip through verify_entry so the
+	## dock shows a green CONFIGURED dot.
+	var c := McpClientRegistry.get_by_id("hermes")
+	var entry := McpJsonStrategy.build_entry(c, "http://x")
+	assert_true(McpJsonStrategy.verify_entry(c, entry, "http://x"),
+		"built entry must verify as a match")
+
+
+func test_hermes_verify_flags_pre_fix_typeless_entry_as_drift() -> void:
+	## A legacy entry without the streamable-http type field must register as
+	## drift so the dock prompts reconfiguration.
+	var c := McpClientRegistry.get_by_id("hermes")
+	var current := McpJsonStrategy.build_entry(c, "http://x")
+	assert_true(McpJsonStrategy.verify_entry(c, current, "http://x"), "current entry must verify")
+	var legacy_typeless := {"url": "http://x"}
+	assert_false(McpJsonStrategy.verify_entry(c, legacy_typeless, "http://x"),
+		"typeless entry must register as drift")
+	var wrong_type := {"type": "sse", "url": "http://x"}
+	assert_false(McpJsonStrategy.verify_entry(c, wrong_type, "http://x"),
+		"sse entry must register as drift")
+	var url_drift := {"type": "streamable-http", "url": "http://other"}
+	assert_false(McpJsonStrategy.verify_entry(c, url_drift, "http://x"),
+		"URL drift must still register as drift")
+
+
+func test_hermes_windows_path_template_uses_appdata() -> void:
+	## Hermes stores MCP config at %APPDATA%/hermes/mcp.json on Windows.
+	var c := McpClientRegistry.get_by_id("hermes")
+	assert_true(c != null, "hermes client must be registered")
+	assert_true(c.path_template.has("windows"), "hermes descriptor must declare a windows path_template")
+	var windows_template: String = c.path_template["windows"]
+	assert_contains(windows_template, "%APPDATA%",
+		"windows template must use %%APPDATA%%, got: %s" % windows_template)
+
+
+func test_hermes_unix_path_template_uses_home() -> void:
+	## Hermes stores MCP config at ~/.hermes/mcp.json on Unix.
+	var c := McpClientRegistry.get_by_id("hermes")
+	assert_true(c != null)
+	assert_true(c.path_template.has("unix"), "hermes descriptor must declare a unix path_template")
+	assert_eq(c.path_template["unix"], "~/.hermes/mcp.json")
+
+
+func test_hermes_has_no_uvx_bridge() -> void:
+	## Hermes Agent is HTTP-native — no uvx mcp-proxy bridge needed.
+	var c := McpClientRegistry.get_by_id("hermes")
+	assert_eq(c.entry_uvx_bridge, McpClient.UvxBridge.NONE)
+
+
+func test_hermes_is_in_required_registry_check() -> void:
+	## Ensure test_registry_loads_all_clients would not break if this test
+	## was added to the required client list — just a forward-compat guard.
+	assert_true(McpClientRegistry.has_id("hermes"), "hermes client must be in registry")
 
 
 func test_opencode_client_uses_home_config_on_windows() -> void:

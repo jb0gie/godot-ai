@@ -27,10 +27,11 @@ import difflib
 import logging
 
 from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ValidationError as FastMCPValidationError
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools.base import ToolResult
 from mcp.types import CallToolRequestParams
-from pydantic import ValidationError
+from pydantic import ValidationError as PydanticValidationError
 
 from godot_ai.tools._meta_tool import MANAGE_TOOL_OPS
 
@@ -43,32 +44,54 @@ class HintOpTypoOnManage(Middleware):
         context: MiddlewareContext[CallToolRequestParams],
         call_next: CallNext[CallToolRequestParams, ToolResult],
     ) -> ToolResult:
+        candidates = MANAGE_TOOL_OPS.get(context.message.name)
+        if candidates is None:
+            return await call_next(context)
+
         try:
             return await call_next(context)
-        except ValidationError as exc:
-            candidates = MANAGE_TOOL_OPS.get(context.message.name)
-            if candidates is None:
-                raise
-            hint = _build_hint(exc, context.message.arguments, candidates)
-            if hint is None:
-                raise
-            logger.debug("Rewrote op typo error on %s: %s", context.message.name, hint)
-            raise ToolError(hint) from exc
+        except FastMCPValidationError as exc:
+            cause = exc.__cause__
+            pydantic_exc = cause if isinstance(cause, PydanticValidationError) else None
+            self._rewrite_or_reraise(pydantic_exc, context.message.arguments, candidates, exc)
+            raise  # unreachable, silence type checker
+        except PydanticValidationError as exc:
+            # Unit tests may raise the raw pydantic error directly;
+            # in production FastMCP wraps it, but be defensive.
+            self._rewrite_or_reraise(exc, context.message.arguments, candidates, exc)
+            raise  # unreachable, silence type checker
+
+    def _rewrite_or_reraise(
+        self,
+        pydantic_exc: PydanticValidationError | None,
+        arguments: dict | None,
+        candidates: tuple[str, ...] | None,
+        orig_exc: BaseException,
+    ) -> None:
+        """Rewrite the error with a hint or re-raise the original."""
+        hint = _build_hint(pydantic_exc, arguments, candidates)
+        if hint is None:
+            raise orig_exc
+        logger.debug("Rewrote op typo error: %s", hint)
+        raise ToolError(hint) from pydantic_exc
 
 
 def _build_hint(
-    exc: ValidationError, arguments: dict | None, candidates: tuple[str, ...]
+    exc: PydanticValidationError | None, arguments: dict | None, candidates: tuple[str, ...]
 ) -> str | None:
     """Return a ``Did you mean`` message for an op literal_error, else None.
 
-    Returns None — leaving Pydantic's normal message — in three cases:
-      1. The error doesn't include a ``literal_error`` on the ``op`` field.
-      2. The same call has additional validation errors (e.g. a wrong-typed
+    Returns None — leaving the caller to re-raise — in these cases:
+      1. The pydantic error is None (unexpected exception chain).
+      2. The error doesn't include a ``literal_error`` on the ``op`` field.
+      3. The same call has additional validation errors (e.g. a wrong-typed
          ``params``); rewriting would mask them.
-      3. The user's ``op`` value isn't a string in a way ``difflib`` can
+      4. The user's ``op`` value isn't a string in a way ``difflib`` can
          compare; we still emit a clear "op must be a string" hint instead
          of silently swapping in an empty placeholder.
     """
+    if exc is None:
+        return None
     errors = exc.errors()
     if len(errors) != 1:
         return None

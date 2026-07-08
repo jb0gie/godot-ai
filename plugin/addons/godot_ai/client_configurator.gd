@@ -20,6 +20,7 @@ const Client := preload("res://addons/godot_ai/clients/_base.gd")
 const ClientRegistry := preload("res://addons/godot_ai/clients/_registry.gd")
 const JsonStrategy := preload("res://addons/godot_ai/clients/_json_strategy.gd")
 const TomlStrategy := preload("res://addons/godot_ai/clients/_toml_strategy.gd")
+const YamlStrategy := preload("res://addons/godot_ai/clients/_yaml_strategy.gd")
 const CliStrategy := preload("res://addons/godot_ai/clients/_cli_strategy.gd")
 const ManualCommand := preload("res://addons/godot_ai/clients/_manual_command.gd")
 const CliFinder := preload("res://addons/godot_ai/clients/_cli_finder.gd")
@@ -283,6 +284,8 @@ static func _dispatch_configure(client: Client, url: String) -> Dictionary:
 			return JsonStrategy.configure(client, SERVER_NAME, url)
 		"toml":
 			return TomlStrategy.configure(client, SERVER_NAME, url)
+		"yaml":
+			return YamlStrategy.configure(client, SERVER_NAME, url)
 		"cli":
 			# #463: fall back to writing the config file directly when the CLI
 			# binary isn't on PATH (Claude Code as a VS Code/Cursor extension).
@@ -298,6 +301,8 @@ static func _dispatch_remove(client: Client) -> Dictionary:
 			return JsonStrategy.remove(client, SERVER_NAME)
 		"toml":
 			return TomlStrategy.remove(client, SERVER_NAME)
+		"yaml":
+			return YamlStrategy.remove(client, SERVER_NAME)
 		"cli":
 			# #463: mirror the configure fallback so Remove also works without
 			# the CLI binary — otherwise a fallback-written entry is unremovable.
@@ -321,6 +326,8 @@ static func _dispatch_check_status_with_cli_path_details(client: Client, url: St
 			return {"status": JsonStrategy.check_status(client, SERVER_NAME, url), "error_msg": ""}
 		"toml":
 			return {"status": TomlStrategy.check_status(client, SERVER_NAME, url), "error_msg": ""}
+		"yaml":
+			return {"status": YamlStrategy.check_status(client, SERVER_NAME, url), "error_msg": ""}
 		"cli":
 			var resolved_cli := cli_path if not cli_path.is_empty() else CliStrategy.resolve_cli_path(client)
 			# #463: with no CLI binary, read the JSON fallback config so a

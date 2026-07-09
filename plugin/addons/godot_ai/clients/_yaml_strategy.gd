@@ -12,7 +12,7 @@ extends RefCounted
 ## that block. No general YAML parser — Godot has none in stdlib, and Hermes
 ## only needs this one shape. See issue #640.
 
-const INDENT := "\t"
+const INDENT := "  "  # YAML forbids tab indentation; match the 2-space style of ~/.hermes/config.yaml
 
 
 static func configure(client: McpClient, server_name: String, server_url: String) -> Dictionary:

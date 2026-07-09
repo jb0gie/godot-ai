@@ -26,11 +26,11 @@ static func configure(client: McpClient, server_name: String, server_url: String
 
 	var text: String = read["data"]
 	var block := _extract_block(text)
-	var entries := block["entries"]
+	var entries: Dictionary = block["entries"]
 
 	# Preserve existing entry's user-mutable keys; force url.
 	var existing: Dictionary = entries.get(server_name, {})
-	var new_entry := _build_entry(client, server_url, existing)
+	var new_entry := build_entry(client, server_url, existing)
 	entries[server_name] = new_entry
 
 	var out := _assemble(text, block["prefix_lines"], entries, block["suffix_lines"])
@@ -76,10 +76,13 @@ static func remove(client: McpClient, server_name: String) -> Dictionary:
 
 
 ## Build the entry dict written under mcp_servers[server_name].
-## Hermes HTTP entries: { url: <url> } plus preserved user keys
-## (headers, enabled, tools, ...). No `type` field — transport inferred.
-static func build_entry(client: McpClient, server_url: String, existing: Variant = null) -> Dictionary:
-	var entry: Dictionary = (existing as Dictionary).duplicate() if existing is Dictionary else {}
+## Hermes HTTP entries are transport-inferred: just { url: <url> }. We do NOT
+## preserve stale keys from a prior entry (e.g. a `command: uvx mcp-proxy`
+## stdio-bridge form) — Hermes would then have both a url and a command and
+## pick the wrong transport. A clean { url: ... } is the correct, documented
+## Hermes shape. No `type` field.
+static func build_entry(client: McpClient, server_url: String, _existing: Variant = null) -> Dictionary:
+	var entry: Dictionary = {}
 	entry[client.entry_url_field] = server_url
 	return entry
 
@@ -101,9 +104,9 @@ static func verify_entry(client: McpClient, entry: Dictionary, server_url: Strin
 ## user's config.yaml byte-for-byte intact.
 static func _extract_block(text: String) -> Dictionary:
 	var lines := text.split("\n", false)
-	var prefix: Array[String] = []
+	var prefix: PackedStringArray = []
 	var entries: Dictionary = {}
-	var suffix: Array[String] = []
+	var suffix: PackedStringArray = []
 	var header_idx := -1
 	for i in range(lines.size()):
 		if lines[i].strip_edges().begins_with("mcp_servers:"):
@@ -117,17 +120,29 @@ static func _extract_block(text: String) -> Dictionary:
 	for i in range(0, header_idx):
 		prefix.append(lines[i])
 
-	# Walk indented entries until the next top-level key (no indent) or EOF.
+	# Determine the indent of the first entry so we can tell sibling
+	# entries (same indent) apart from nested keys (deeper indent) and
+	# parent-level keys (less indent). All server entries under
+	# `mcp_servers:` share one indent level; breaking on 0-indent alone
+	# mis-nests 2-space-indented siblings under the first entry.
+	var entry_indent := -1
+	var probe := header_idx + 1
+	while probe < lines.size() and lines[probe].strip_edges().is_empty():
+		probe += 1
+	if probe < lines.size():
+		entry_indent = _indent_of(lines[probe])
+
 	var i := header_idx + 1
 	while i < lines.size():
 		var raw := lines[i]
 		if raw.strip_edges().is_empty():
 			i += 1
 			continue
-		# Top-level key = first char is not whitespace.
-		if not (raw[0] == " " or raw[0] == "\t"):
+		# Stop at any line indented less than a sibling entry (parent key
+		# or a new top-level section), or at the header's own level.
+		if _indent_of(raw) < entry_indent:
 			break
-		var entry := _parse_entry(raw, lines, i)
+		var entry := _parse_entry(raw, lines, i, entry_indent)
 		if not entry["name"].is_empty():
 			entries[entry["name"]] = entry["data"]
 		i = entry["next_idx"]
@@ -140,7 +155,7 @@ static func _extract_block(text: String) -> Dictionary:
 
 ## Parse one `  name:` entry starting at `lines[start]`. Consumes all deeper-
 ## indented sublines (url, headers, etc.) and returns the next sibling index.
-static func _parse_entry(raw: String, lines: Array[String], start: int) -> Dictionary:
+static func _parse_entry(raw: String, lines: PackedStringArray, start: int, entry_indent: int) -> Dictionary:
 	var name := raw.strip_edges().trim_suffix(":").strip_edges()
 	var data: Dictionary = {}
 	var i := start + 1
@@ -149,8 +164,9 @@ static func _parse_entry(raw: String, lines: Array[String], start: int) -> Dicti
 		if l.strip_edges().is_empty():
 			i += 1
 			continue
-		if not (l[0] == " " or l[0] == "\t"):
-			break  # sibling or parent-level key
+		# A line at or above the entry's indent is a sibling/parent key.
+		if _indent_of(l) <= entry_indent:
+			break
 		var stripped := l.strip_edges()
 		var colon := stripped.find(":")
 		if colon < 0:
@@ -161,7 +177,7 @@ static func _parse_entry(raw: String, lines: Array[String], start: int) -> Dicti
 		if val.is_empty():
 			# Nested block (e.g. headers:). Parse as raw sub-dict lines for
 			# preservation; we don't introspect deeper than url at the top.
-			var sub := _parse_subblock(lines, i + 1)
+			var sub := _parse_subblock(lines, i + 1, entry_indent)
 			data[key] = sub["value"]
 			i = sub["next_idx"]
 		else:
@@ -173,7 +189,7 @@ static func _parse_entry(raw: String, lines: Array[String], start: int) -> Dicti
 ## Parse a nested block (e.g. headers:) as a preserved sub-dictionary of
 ## scalar key/values. Deeper nesting is flattened into scalar strings — fine
 ## for Hermes' known shape (headers are flat key: value).
-static func _parse_subblock(lines: Array[String], start: int) -> Dictionary:
+static func _parse_subblock(lines: PackedStringArray, start: int, entry_indent: int) -> Dictionary:
 	var sub: Dictionary = {}
 	var i := start
 	while i < lines.size():
@@ -181,7 +197,8 @@ static func _parse_subblock(lines: Array[String], start: int) -> Dictionary:
 		if l.strip_edges().is_empty():
 			i += 1
 			continue
-		if not (l[0] == " " or l[0] == "\t"):
+		# A line at or above the parent entry's indent ends the nested block.
+		if _indent_of(l) <= entry_indent:
 			break
 		var stripped := l.strip_edges()
 		var colon := stripped.find(":")
@@ -200,12 +217,12 @@ static func _parse_subblock(lines: Array[String], start: int) -> Dictionary:
 
 ## Reassemble the full file text from prefix + a freshly built mcp_servers
 ## block + suffix. If the block didn't exist before, it is appended.
-static func _assemble(_text: String, prefix: Array[String], entries: Dictionary, suffix: Array[String]) -> String:
-	var out: Array[String] = []
+static func _assemble(_text: String, prefix: PackedStringArray, entries: Dictionary, suffix: PackedStringArray) -> String:
+	var out: PackedStringArray = []
 	for l in prefix:
 		out.append(l)
 	# Trim trailing blank lines from prefix so we don't stack double blanks.
-	while out.size() > 0 and out[-1].strip_edges().is_empty():
+	while out.size() > 0 and out[out.size() - 1].strip_edges().is_empty():
 		out.remove_at(out.size() - 1)
 
 	if not _text.contains("mcp_servers:"):
@@ -228,8 +245,8 @@ static func _assemble(_text: String, prefix: Array[String], entries: Dictionary,
 
 ## Emit one `  name:` entry with its scalar keys (top level only; headers
 ## sub-dict is re-emitted as nested scalars).
-static func _emit_entry(name: String, data: Dictionary) -> Array[String]:
-	var lines: Array[String] = []
+static func _emit_entry(name: String, data: Dictionary) -> PackedStringArray:
+	var lines: PackedStringArray = []
 	lines.append(INDENT + "%s:" % name)
 	for key in data:
 		var val = data[key]
@@ -252,6 +269,16 @@ static func _emit_scalar(v: Variant) -> String:
 			return str(float(v))
 		_:
 			return str(v)
+
+
+## Returns the leading-whitespace indent width of a line (spaces + tabs
+## counted as 1 each). Used to distinguish sibling entries (same indent)
+## from nested keys (deeper indent) and parent-level keys (less indent).
+static func _indent_of(line: String) -> int:
+	var n := 0
+	while n < line.length() and (line[n] == " " or line[n] == "\t"):
+		n += 1
+	return n
 
 
 ## Minimal scalar coercion for parsed YAML values. Quotes are stripped;

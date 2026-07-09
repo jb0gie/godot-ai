@@ -10,9 +10,12 @@ func _init() -> void:
 	# Hermes reads MCP config from ~/.hermes/config.yaml (YAML), NOT mcp.json.
 	# Verified against the official docs:
 	# https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp
+	# Windows: Hermes stores config under $LOCALAPPDATA/hermes (NOT $APPDATA,
+	# which is Roaming) — confirmed by where the running Hermes process reads.
+	# NOTE: _path_template.expand() only substitutes $VAR tokens, not %VAR%.
 	path_template = {
 		"unix": "~/.hermes/config.yaml",
-		"windows": "%APPDATA%/hermes/config.yaml"
+		"windows": "$LOCALAPPDATA/hermes/config.yaml"
 	}
 
 	# Hermes uses the snake_case `mcp_servers` key (not `mcpServers`).
